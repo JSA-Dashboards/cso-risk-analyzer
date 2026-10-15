@@ -4,9 +4,10 @@ Streamlit risk tool for **CME calendar spread options** (CSOs) and spread future
 CSOs to manage carry/spread risk. Owner repo: `JSA-Dashboards/cso-risk-analyzer`.
 
 > The code is public (and mirrored into the public admin-portal repo), so access control lives in the
-> deployed app, not the repo. A standalone run has **no login**; inside the admin portal the tile sits behind
-> the portal's shared login. Prices, vols and expiries in the app are placeholders, and nothing here is
-> trading advice.
+> deployed app, not the repo. A standalone run asks for one shared password (`APP_PASSWORD` in `cso/auth.py`,
+> the same generic gate as the Risk Analyzer's — it keeps casual visitors out, it is not per-user security);
+> inside the admin portal the sync pre-passes it (`preauth`), so the portal's login is the only gate there.
+> Prices, vols and expiries in the app are placeholders, and nothing here is trading advice.
 
 ```
 pip install -r requirements-dev.txt

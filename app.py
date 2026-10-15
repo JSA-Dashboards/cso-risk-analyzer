@@ -10,10 +10,13 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cso import book, pricing
+from cso.auth import require_password
 
 st.set_page_config(page_title="CSO & spread risk analyzer", page_icon=":material/stacked_line_chart:", layout="wide")
 # Hide the Streamlit Community Cloud viewer badge (profile avatar -> the account's other apps).
 st.markdown("<style>[class*='_profileContainer_']{display:none !important;}</style>", unsafe_allow_html=True)
+
+require_password()      # nothing below renders until it passes (the admin portal pre-passes it)
 
 TODAY = date.today()
 NEAR_FAR, FAR_NEAR = "Near − far", "Far − near"
