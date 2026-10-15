@@ -2,8 +2,8 @@
 
 Paragraph 2 is the firm's standard text, copied unchanged from the Risk Analyzer's disclaimer
 (jsa-risk-analyzer, src/jsa_risk/ui/theme.py). Paragraph 1 is that app's model paragraph with only the
-model sentence (Black-76 -> Bachelier spread-option model) and the market-data sentence (this app has no
-live feed) changed. Compliance should confirm the adapted sentences.
+model sentence changed (Black-76 -> Bachelier spread-option model), "entered or imported" -> "entered", and
+one sentence added about the example data. Compliance should confirm the adapted wording.
 """
 import streamlit as st
 
@@ -13,8 +13,9 @@ MODEL_PARAGRAPH = (
     "They are provided for informational and analytical purposes only, do not constitute a guarantee of "
     "accuracy, and may differ materially from actual market prices, executable levels, or realized "
     "results. Verify all figures against an official broker or exchange source before making any trading "
-    "or risk decision. Prices, volatilities, premiums and expiry dates shown in the example data are "
-    "illustrative only, and this dashboard does not use a live market-data feed."
+    "or risk decision. Futures prices pulled via a live market-data feed are delayed approximately 10 "
+    "minutes and are not real-time or executable quotes. Prices, volatilities, premiums and expiry dates "
+    "shown in the example data are illustrative only."
 )
 
 STANDARD_PARAGRAPH = (

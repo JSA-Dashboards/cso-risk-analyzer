@@ -38,6 +38,9 @@ def test_disclosure_is_on_the_page_and_paragraph_two_is_the_firms_standard_text(
     assert disclosure.MODEL_PARAGRAPH in text and disclosure.STANDARD_PARAGRAPH in text
     assert "does not accept orders to buy or sell any financial instruments via email" in text
     assert "Bachelier" in text and "Black-76" not in text
+    # the data-feed sentence is the Risk Analyzer's own wording, now that this app does pull prices from a feed
+    assert ("Futures prices pulled via a live market-data feed are delayed approximately 10 minutes and are "
+            "not real-time or executable quotes.") in disclosure.MODEL_PARAGRAPH
     # paragraph 2 is byte-for-byte the Risk Analyzer's text when that repo sits alongside this one
     ra = ROOT.parent / "jsa-risk-analyzer" / "src" / "jsa_risk" / "ui" / "theme.py"
     if ra.exists():

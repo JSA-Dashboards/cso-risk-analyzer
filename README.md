@@ -25,6 +25,13 @@ cso_risk_analyzer` in the portal repo (the daily sync PR also picks it up). The 
 database, so the portal needs nothing extra. Session and widget keys are prefixed `cso_` because every bundled
 app shares one session.
 
+## Secrets
+
+One optional secret: **`MASSIVE_API_KEY`** (root level in Streamlit Secrets, like the admin portal; a `[massive]` table with
+`api_key` also works, as does the environment variable). It turns on the *Fetch futures prices* button, which fills each
+spread's near and far price from Massive's delayed futures snapshot. The key stays server-side and is sent as a header.
+Without it the button is off and the app works with typed prices. Nothing else needs a secret.
+
 ## What it models
 
 - **A CSO is one option on one number — the futures spread, nearby − deferred** (grain/oilseed CSOs, Chapter 10J for

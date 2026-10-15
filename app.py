@@ -1,5 +1,5 @@
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import altair as alt
@@ -9,7 +9,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cso import book, pricing
+from cso import book, massive, pricing
 from cso.auth import require_password
 from cso.disclosure import render_disclosure
 
@@ -80,6 +80,7 @@ def _set_inputs(spreads_df, pos_df, quotes_df, example: bool) -> None:
     st.session_state.cso_reset_n = st.session_state.get("cso_reset_n", -1) + 1   # fresh editor keys
     st.session_state.cso_is_example = example
     st.session_state.cso_example_touched = False
+    st.session_state.cso_fetch_note = None
 
 
 def _load_blank() -> None:
@@ -102,6 +103,73 @@ def _apply_spread_vol(sid: str, vol: float) -> None:
     st.session_state.cso_spreads_df = df
     st.session_state.cso_spreads_ver += 1      # new editor key => editor restarts from the updated frame
     st.session_state.cso_example_touched = True
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_quotes(tickers: tuple, _key: str) -> dict:
+    """One Massive snapshot per two minutes for a set of contracts (the key is not part of the cache key)."""
+    return massive.fetch_snapshot(_key, tickers)
+
+
+def _clock(ts: datetime) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return f"{ts.astimezone(ZoneInfo('America/Chicago')):%b %d %H:%M} CT"
+    except Exception:                      # no tz database on this machine: say UTC instead
+        return f"{ts:%b %d %H:%M} UTC"
+
+
+def _fetch_prices() -> None:
+    """Fill every spread's near and far price from Massive. The outcome goes to cso_fetch_note."""
+    ss = st.session_state
+    key = massive.api_key_from(st.secrets)
+    if not key:
+        ss.cso_fetch_note = ("warn", "No Massive API key is set for this app.")
+        return
+    product, today = massive.PRODUCT_CODES.get(ss["cso_commodity"]), ss["cso_val_date"]
+    df = ss["_cso_spreads_edited"].copy()
+    pairs = {i: (massive.ticker_for(product, _txt(r.get("Near")), today),
+                 massive.ticker_for(product, _txt(r.get("Far")), today)) for i, r in df.iterrows()}
+    wanted = tuple(sorted({t for pair in pairs.values() for t in pair if t}))
+    if not wanted:
+        ss.cso_fetch_note = ("warn", "Give each spread near and far contract labels like Dec26 and Mar27 so their "
+                                     "prices can be looked up.")
+        return
+    try:
+        quotes = _cached_quotes(wanted, key)
+    except massive.MassiveError as exc:
+        ss.cso_fetch_note = ("warn", f"Could not fetch prices: {exc}.")
+        return
+    used, missing, overridden = [], [], []
+    for i, (near, far) in pairs.items():
+        for col, ticker in (("Near price", near), ("Far price", far)):
+            if ticker is None:
+                continue
+            q = quotes.get(ticker)
+            if q is None:
+                missing.append(ticker)
+                continue
+            df.at[i, col] = q.price
+            used.append(q)
+        if _num(df.at[i, "Spread level"]) is not None:
+            overridden.append(_txt(df.at[i, "Spread"], "a spread"))
+    if not used:
+        ss.cso_fetch_note = ("warn", "No prices came back for " + ", ".join(sorted(set(missing))) + ".")
+        return
+    stamps = [q.as_of for q in used if q.as_of is not None]
+    text = ("Prices from Massive" + (" (delayed)" if any(q.delayed for q in used) else "") +
+            (f", last trade {_clock(max(stamps))}" if stamps else "") + ": " +
+            ", ".join(f"{q.ticker} {q.price:g}" + ("" if q.source == "last" else f" ({q.source})")
+                      for q in sorted({q.ticker: q for q in used}.values(), key=lambda q: q.ticker)) + ".")
+    if missing:
+        text += " No quote for " + ", ".join(sorted(set(missing))) + "."
+    if overridden:
+        text += (" Spread level is typed in for " + ", ".join(overridden) +
+                 ", so these prices don't change it; clear that cell to use them.")
+    ss.cso_fetch_note = ("warn" if (missing or overridden) else "ok", text)
+    ss.cso_spreads_df = df
+    ss.cso_spreads_ver += 1
+    ss.cso_example_touched = True
 
 
 def usd(x):
@@ -167,6 +235,20 @@ if st.session_state.cso_is_example:
 
 # --------------------------------------------------------------------------- 1 spreads
 st.subheader("1 · Spreads")
+_has_key = massive.api_key_from(st.secrets) is not None
+fetch_col, note_col = st.columns([1.7, 4], vertical_alignment="center")
+fetch_col.button("Fetch futures prices", key="cso_fetch_prices", on_click=_fetch_prices, width="stretch",
+                 icon=":material/cloud_download:", disabled=not _has_key,
+                 help="Looks up the near and far futures price of every spread (e.g. Dec26 and Mar27 become "
+                      "ZCZ6 and ZCH7) from the market-data feed. Prices are delayed about 10 minutes.")
+_note = st.session_state.get("cso_fetch_note")
+if not _has_key:
+    note_col.caption("To fetch prices, add MASSIVE_API_KEY to this app's Secrets.")
+elif _note:
+    (note_col.warning if _note[0] == "warn" else note_col.caption)(_note[1])
+else:
+    note_col.caption("Fills the near and far price of each spread from the market-data feed (delayed about "
+                     "10 minutes) using the labels in the Near and Far columns.")
 show_legs = st.toggle("Show leg vol / correlation columns", value=False, key="cso_show_legs",
                       help="Only needed for the 'Legs' vol source or the diagnostic below. Spread vol should "
                            "normally be typed in or backed out of quotes.")
@@ -597,7 +679,11 @@ with st.expander("Model and contract assumptions"):
   Kirk's approximation gives the same prices to within 0.01¢ for corn-sized spreads, so the vol input — and how it
   varies by strike — is what matters, not the model.
 - **Not modelled:** a hard full-carry bound in pricing (the optional Full carry only truncates the Monte Carlo),
-  vol term structure across expiries beyond what the quotes imply, early exercise (none for these), and bid/offer.
+  vol term structure across expiries beyond what the quotes imply, and bid/offer. CME CSOs are European, so
+  early exercise doesn't arise; for an American-style spread option the premium this ignores is typically
+  under half a tick for six months or less at 4% rates.
+- **Prices:** the Fetch button pulls delayed futures prices from the market-data feed. Anything you type stays
+  until you fetch again.
 - **Check before trading:** the expiry date for each series, the listed strikes and the contract size, against
   CME's current contract specifications and expiry calendar.
         """)
