@@ -14,8 +14,25 @@ from cso.auth import require_password
 from cso.disclosure import render_disclosure
 
 st.set_page_config(page_title="CSO & spread risk analyzer", page_icon=":material/stacked_line_chart:", layout="wide")
-# Hide the Streamlit Community Cloud viewer badge (profile avatar -> the account's other apps).
-st.markdown("<style>[class*='_profileContainer_']{display:none !important;}</style>", unsafe_allow_html=True)
+# Hide the Streamlit Community Cloud viewer badge (creator avatar -> the account's other apps, plus the Streamlit
+# logo). Cloud draws it on its OUTER page, outside this app's iframe, so CSS here can't reach it (checked live:
+# still display:flex). The iframe is same-origin, so a script adds the rule to the parent document instead.
+# Guarded by id; a no-op when run locally, where there is no outer page. Same snippet as the admin portal's.
+st.html(
+    """<script>
+    (function () {
+      try {
+        var doc = window.parent.document;
+        if (doc.getElementById('jsa-hide-cloud-badge')) return;
+        var s = doc.createElement('style');
+        s.id = 'jsa-hide-cloud-badge';
+        s.textContent = "[class*='_profileContainer_'],[class*='_viewerBadge_']{display:none !important;}";
+        doc.head.appendChild(s);
+      } catch (e) {}
+    })();
+    </script>""",
+    unsafe_allow_javascript=True,
+)
 
 require_password()      # nothing below renders until it passes (the admin portal pre-passes it)
 

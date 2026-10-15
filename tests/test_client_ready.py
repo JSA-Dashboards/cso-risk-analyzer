@@ -81,3 +81,12 @@ def test_a_spread_without_a_vol_is_flagged_not_silently_assumed():
               cso_spreads_df=spreads, cso_pos_df=pos, cso_quotes_df=pd.DataFrame())
     assert not at.exception
     assert any("no spread vol entered" in str(w.value) for w in at.warning)
+
+
+def test_cloud_badge_is_hidden_on_the_outer_page_not_just_inside_the_iframe():
+    # a CSS rule inside the app can't reach Cloud's outer page (it stayed display:flex on the live app), so the
+    # app must inject the rule into window.parent.document, as the admin portal and the Risk Analyzer do
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "window.parent.document" in src and "jsa-hide-cloud-badge" in src
+    assert "_profileContainer_" in src and "unsafe_allow_javascript=True" in src
+    assert not _app().exception
