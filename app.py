@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cso import book, pricing
 from cso.auth import require_password
+from cso.disclosure import render_disclosure
 
 st.set_page_config(page_title="CSO & spread risk analyzer", page_icon=":material/stacked_line_chart:", layout="wide")
 # Hide the Streamlit Community Cloud viewer badge (profile avatar -> the account's other apps).
@@ -30,27 +31,67 @@ def _eighth(x: float) -> float:
 
 
 # --------------------------------------------------------------------------- state
-if "cso_spreads_df" not in st.session_state:
-    st.session_state.cso_spreads_df = pd.DataFrame([{
+LOGO = Path(__file__).resolve().parent / "assets" / "jsa_logo.png"
+
+_SPREAD_DTYPES = {"Spread": "object", "Near": "object", "Far": "object", "Near price": "float64",
+                  "Far price": "float64", "Spread level": "float64", "Spread vol": "float64",
+                  "Full carry": "float64", "Convention": "object", "Vol source": "object",
+                  "Near vol %": "float64", "Far vol %": "float64", "Corr": "float64"}
+_POS_DTYPES = {"Spread": "object", "Role": "object", "Type": "object", "Qty": "float64", "Strike": "float64",
+               "Expiry": "datetime64[ns]", "Vol override": "float64", "Entry": "float64"}
+_QUOTE_DTYPES = {"Spread": "object", "Type": "object", "Strike": "float64", "Expiry": "datetime64[ns]",
+                 "Premium": "float64"}
+
+
+def _blank(dtypes: dict) -> pd.DataFrame:
+    return pd.DataFrame({c: pd.Series(dtype=t) for c, t in dtypes.items()})
+
+
+def _example_spreads() -> pd.DataFrame:
+    return pd.DataFrame([{
         "Spread": "Dec/Mar", "Near": "Dec26", "Far": "Mar27", "Near price": 430.0, "Far price": 445.0,
         "Spread level": None, "Spread vol": 20.0, "Full carry": None, "Convention": NEAR_FAR,
         "Vol source": "Direct", "Near vol %": 22.0, "Far vol %": 21.0, "Corr": 0.97,
     }])
-    st.session_state.cso_spreads_ver = 0
-if "cso_pos_df" not in st.session_state:
-    st.session_state.cso_pos_df = pd.DataFrame([
+
+
+def _example_positions() -> pd.DataFrame:
+    return pd.DataFrame([
         {"Spread": "Dec/Mar", "Role": book.ROLE_EXPOSURE, "Type": "Spread future", "Qty": 10.0, "Strike": None,
          "Expiry": None, "Vol override": None, "Entry": -15.0},
         {"Spread": "Dec/Mar", "Role": book.ROLE_BOOK, "Type": "Put", "Qty": 10.0, "Strike": -20.0,
          "Expiry": TODAY + timedelta(days=36), "Vol override": None, "Entry": None},
     ])
-if "cso_quotes_df" not in st.session_state:
-    _T0, _S0 = 36 / 365, -15.0
-    _ex = TODAY + timedelta(days=36)
-    st.session_state.cso_quotes_df = pd.DataFrame([
-        {"Spread": "Dec/Mar", "Type": t, "Strike": k, "Expiry": _ex,
-         "Premium": _eighth(float(pricing.price(t == "Call", _S0, k, v, _T0, 0.04)))}
+
+
+def _example_quotes() -> pd.DataFrame:
+    t0, s0, ex = 36 / 365, -15.0, TODAY + timedelta(days=36)
+    return pd.DataFrame([
+        {"Spread": "Dec/Mar", "Type": t, "Strike": k, "Expiry": ex,
+         "Premium": _eighth(float(pricing.price(t == "Call", s0, k, v, t0, 0.04)))}
         for t, k, v in (("Put", -30.0, 24.0), ("Put", -20.0, 21.0), ("Call", -10.0, 19.0))])
+
+
+def _set_inputs(spreads_df, pos_df, quotes_df, example: bool) -> None:
+    st.session_state.cso_spreads_df = spreads_df
+    st.session_state.cso_pos_df = pos_df
+    st.session_state.cso_quotes_df = quotes_df
+    st.session_state.cso_spreads_ver = 0
+    st.session_state.cso_reset_n = st.session_state.get("cso_reset_n", -1) + 1   # fresh editor keys
+    st.session_state.cso_is_example = example
+    st.session_state.cso_example_touched = False
+
+
+def _load_blank() -> None:
+    _set_inputs(_blank(_SPREAD_DTYPES), _blank(_POS_DTYPES), _blank(_QUOTE_DTYPES), False)
+
+
+def _load_example() -> None:
+    _set_inputs(_example_spreads(), _example_positions(), _example_quotes(), True)
+
+
+if "cso_reset_n" not in st.session_state:
+    _load_example()                 # first visit: open on a worked example, clearly labelled as one
 
 
 def _apply_spread_vol(sid: str, vol: float) -> None:
@@ -60,6 +101,7 @@ def _apply_spread_vol(sid: str, vol: float) -> None:
     df.loc[m, "Vol source"] = "Direct"
     st.session_state.cso_spreads_df = df
     st.session_state.cso_spreads_ver += 1      # new editor key => editor restarts from the updated frame
+    st.session_state.cso_example_touched = True
 
 
 def usd(x):
@@ -86,15 +128,42 @@ with st.sidebar:
                          help="Prices each option at the vol interpolated from the market-maker quotes (step 2) "
                               "for the same spread and expiry. Rows with their own Vol override keep it.")
     st.divider()
-    st.caption("Prices, vols, premiums and expiries pre-filled are **placeholders** — overwrite them with live "
-               "quotes and the CME expiry calendar. Figures are theoretical model output, not executable "
-               "quotes or advice; replace this note with the firm's approved disclosure before sharing "
-               "anything with a client.")
+    st.caption("Inputs")
+    st.button("Clear the example data", key="cso_clear_example", on_click=_load_blank, icon=":material/delete:",
+              width="stretch", help="Empties all three input tables so you can enter your own.")
+    st.button("Reload the example", key="cso_reload_example", on_click=_load_example, icon=":material/refresh:",
+              width="stretch", help="Restores the illustrative example book.")
 
-st.title("CSO & spread risk analyzer")
-st.caption("CME calendar spread options (spread = nearby − deferred, European exercise) priced with the normal "
-           "(Bachelier) model on the spread level, so negative carry strikes work. Spread futures and any "
-           "client exposure are risked alongside.")
+logo_col, title_col = st.columns([1, 7], vertical_alignment="center")
+with logo_col:
+    if LOGO.exists():
+        st.image(str(LOGO), width=110)
+with title_col:
+    st.title("CSO & spread risk analyzer")
+    st.caption("CME calendar spread options (spread = nearby − deferred, European exercise) priced with the "
+               "normal (Bachelier) model on the spread level, so negative carry strikes work. Spread futures "
+               "and any exposure being hedged are risked alongside.")
+render_disclosure()
+
+RN, SV = st.session_state.cso_reset_n, st.session_state.cso_spreads_ver
+SPREADS_KEY, QUOTES_KEY, POS_KEY = f"cso_spreads_editor_{RN}_{SV}", f"cso_quotes_editor_{RN}", f"cso_pos_editor_{RN}"
+
+
+def _edited(key) -> bool:
+    state = st.session_state.get(key)
+    return bool(state) and any(state.get(k) for k in ("edited_rows", "added_rows", "deleted_rows"))
+
+
+if any(_edited(k) for k in (SPREADS_KEY, QUOTES_KEY, POS_KEY)):
+    st.session_state.cso_example_touched = True
+if st.session_state.cso_is_example:
+    if not st.session_state.cso_example_touched:
+        st.warning("**Example data.** The prices, volatilities, premiums and expiry dates below are illustrative "
+                   "— not live market data. Replace them with your own, or clear them from the sidebar.",
+                   icon=":material/science:")
+    else:
+        st.caption(":material/science: Any input you haven't changed from the example is illustrative, not "
+                   "live market data.")
 
 # --------------------------------------------------------------------------- 1 spreads
 st.subheader("1 · Spreads")
@@ -102,7 +171,7 @@ show_legs = st.toggle("Show leg vol / correlation columns", value=False, key="cs
                       help="Only needed for the 'Legs' vol source or the diagnostic below. Spread vol should "
                            "normally be typed in or backed out of quotes.")
 spreads_df = st.data_editor(
-    st.session_state.cso_spreads_df, num_rows="dynamic", key=f"cso_spreads_editor_{st.session_state.cso_spreads_ver}",
+    st.session_state.cso_spreads_df, num_rows="dynamic", key=SPREADS_KEY,
     width="stretch", column_order=[c for c in SPREAD_COLS if show_legs or c not in LEG_COLS],
     column_config={
         "Near price": st.column_config.NumberColumn(format="%.2f"),
@@ -139,14 +208,19 @@ for _, r in spreads_df.iterrows():
     if sid in spreads:
         st.warning(f"Duplicate spread name '{sid}' — the last row wins.")
     nv, fv = _num(r.get("Near vol %")), _num(r.get("Far vol %"))
+    vol_in, src = _num(r.get("Spread vol")), _txt(r.get("Vol source"), "Direct")
+    if vol_in is None and not (src == "Legs" and None not in (npx, fpx, nv, fv, _num(r.get("Corr")))):
+        st.warning(f"{sid}: no spread vol entered, so a provisional 20.00 is used for the numbers below. Enter "
+                   "your own (points per year), or back one out of quoted premiums in step 2.")
     spreads[sid] = book.Spread(
         id=sid, near_label=_txt(r.get("Near"), "Near"), far_label=_txt(r.get("Far"), "Far"),
-        near_px=npx, far_px=fpx, spread_vol=_num(r.get("Spread vol")) or 20.0, level_override=lvl,
+        near_px=npx, far_px=fpx, spread_vol=vol_in or 20.0, level_override=lvl,
         full_carry=_num(r.get("Full carry")), vol_source=_txt(r.get("Vol source"), "Direct"),
         near_vol=None if nv is None else nv / 100, far_vol=None if fv is None else fv / 100,
         corr=_num(r.get("Corr")), near_minus_far=_txt(r.get("Convention"), NEAR_FAR) != FAR_NEAR)
 if not spreads:
-    st.info("Add a spread to begin.")
+    st.info("Add a spread to begin: a name, the near and far futures prices (or the spread's own price) and a "
+            "spread vol. Or reload the example from the sidebar.")
     st.stop()
 
 summary = []
@@ -175,7 +249,7 @@ with st.expander("Back out spread vol and skew from quoted premiums", expanded=F
                "spread level. Strikes in 5-point steps, premiums in ⅛ points — and because of that tick, far "
                "out-of-the-money quotes (a few eighths) give coarse vols, off by a point or two.")
     quotes_df = st.data_editor(
-        st.session_state.cso_quotes_df, num_rows="dynamic", key="cso_quotes_editor", width="stretch",
+        st.session_state.cso_quotes_df, num_rows="dynamic", key=QUOTES_KEY, width="stretch",
         column_config={
             "Spread": st.column_config.SelectboxColumn(options=list(spreads), required=True),
             "Type": st.column_config.SelectboxColumn(options=["Call", "Put"], required=True),
@@ -213,11 +287,11 @@ with st.expander("Back out spread vol and skew from quoted premiums", expanded=F
 
 # --------------------------------------------------------------------------- 3 positions
 st.subheader("3 · Positions")
-st.caption("Tag what the client is **hedging** as *Exposure* (e.g. a long spread future standing in for a "
-           "storage/carry position) and the options or spread futures bought against it as *Hedge / trade*. "
+st.caption("Tag what is being **hedged** as *Exposure* (e.g. a long spread future standing in for a "
+           "storage or carry position) and the options or spread futures held against it as *Hedge / trade*. "
            "Leave everything as Hedge / trade for a standalone view.")
 pos_df = st.data_editor(
-    st.session_state.cso_pos_df, num_rows="dynamic", key="cso_pos_editor", width="stretch",
+    st.session_state.cso_pos_df, num_rows="dynamic", key=POS_KEY, width="stretch",
     column_config={
         "Spread": st.column_config.SelectboxColumn(options=list(spreads), required=True),
         "Role": st.column_config.SelectboxColumn(options=list(book.ROLES)),
@@ -524,6 +598,6 @@ with st.expander("Model and contract assumptions"):
   varies by strike — is what matters, not the model.
 - **Not modelled:** a hard full-carry bound in pricing (the optional Full carry only truncates the Monte Carlo),
   vol term structure across expiries beyond what the quotes imply, early exercise (none for these), and bid/offer.
-- **To verify against CME before relying on it:** the exact expiry date for each series (check the CME expiry
-  calendar), the listed strike ladder, and the contract size for each commodity selected.
+- **Check before trading:** the expiry date for each series, the listed strikes and the contract size, against
+  CME's current contract specifications and expiry calendar.
         """)

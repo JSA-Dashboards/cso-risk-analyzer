@@ -7,7 +7,11 @@ CSOs to manage carry/spread risk. Owner repo: `JSA-Dashboards/cso-risk-analyzer`
 > deployed app, not the repo. A standalone run asks for one shared password (`APP_PASSWORD` in `cso/auth.py`,
 > the same generic gate as the Risk Analyzer's — it keeps casual visitors out, it is not per-user security);
 > inside the admin portal the sync pre-passes it (`preauth`), so the portal's login is the only gate there.
-> Prices, vols and expiries in the app are placeholders, and nothing here is trading advice.
+> The app opens on a clearly labelled **example book** (clear it from the sidebar to enter your own). The
+> disclosure at the top is the firm's standard text: paragraph 2 is copied unchanged from the Risk
+> Analyzer (`cso/disclosure.py`), paragraph 1 is that app's model paragraph with only the model sentence
+> (Black-76 → Bachelier) and the data-feed sentence changed — compliance should confirm those. Nothing
+> here is trading advice.
 
 ```
 pip install -r requirements-dev.txt
