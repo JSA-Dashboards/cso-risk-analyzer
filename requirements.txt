@@ -1,0 +1,6 @@
+streamlit>=1.56.0   # st.tabs(on_change="rerun") lazy tabs
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11         # normal CDF/PDF and Brent's method for implied vol
+altair>=5.0
+jinja2>=3.0         # pandas Styler (heat-map tables)
