@@ -1,7 +1,12 @@
 # CSO & spread risk analyzer
 
 Streamlit risk tool for **CME calendar spread options** (CSOs) and spread futures, for a broker whose clients use
-CSOs to manage carry/spread risk. Owner repo: `JSA-Dashboards/cso-risk-analyzer` (private).
+CSOs to manage carry/spread risk. Owner repo: `JSA-Dashboards/cso-risk-analyzer`.
+
+> The code is public (and mirrored into the public admin-portal repo), so access control lives in the
+> deployed app, not the repo. A standalone run has **no login**; inside the admin portal the tile sits behind
+> the portal's shared login. Prices, vols and expiries in the app are placeholders, and nothing here is
+> trading advice.
 
 ```
 pip install -r requirements-dev.txt
