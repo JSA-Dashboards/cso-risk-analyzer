@@ -29,8 +29,9 @@ app shares one session.
 
 One optional secret: **`MASSIVE_API_KEY`** (root level in Streamlit Secrets, like the admin portal; a `[massive]` table with
 `api_key` also works, as does the environment variable). It turns on the *Fetch futures prices* button, which fills each
-spread's near and far price from Massive's delayed futures snapshot; the Strategy builder also reads the fed-funds future and
-the spread's settlement history from it. The key stays server-side and is sent as a header.
+spread's near and far price from Massive's delayed futures snapshot; the Strategy builder also reads the fed-funds future,
+the list of listed contract months (for the leg picker) and the spread's daily settlement history (the traded range, realized
+vol and the seasonal overlay) from it. The key stays server-side and is sent as a header.
 Without it the button is off and the app works with typed prices. Nothing else needs a secret.
 
 ## What it models
@@ -51,6 +52,20 @@ Without it the button is off and the app works with typed prices. Nothing else n
   Cost of Carry calculator: full carry (CME maximum storage + interest at fed funds + 2.25%), % of full carry with
   its traffic light, and the 12-month range the spread has actually traded in (Massive settlement history). It
   needs no book of positions.
+- **Leg picker (Strategy builder, *Spread from → Live curve*):** choose the near and far contract from the feed's current
+  curve (the nearest ten listed months, each with its live price) instead of typing labels. The far contract can only be
+  a later month than the near one. The spread's vol starts at your book's vol if the book has the same pair, else at the
+  pair's realized vol over the last 60 sessions (the box says which), and you overwrite it with the vol you are quoted. It
+  works with an empty book too. *My book* stays the default, so the example and anything typed in step 1 behave as before.
+- **Seasonal overlay (Strategy builder toggle):** the same pair in up to five earlier years, lined up by days to the near
+  contract's last trading day and laid over the live contract (darkest line = most recent year, dotted = the average),
+  with the strategy's strike, break-evens, entry and full carry across it and *today* and the *option expiry* marked.
+  Below it, **what repeating each earlier year's move would have done**: that year's change between the days matching
+  today and the option's expiry, added to today's level, and the strategy's P&L there (green/red, with the position
+  without the option beside it). The same points are dots on the payoff chart. History comes from the feed's daily bars,
+  which begin in autumn 2021, so there are at most five years and the oldest may be partial. It is a scenario read off a
+  handful of years, not a forecast; the Cost of Carry calculator's 15-year Moore-style outlook needs an older archive
+  and is not built here.
 - **Other tabs:** Book & Greeks (+ delta in futures-month terms), spread-move grid, spread move × vol matrix, theta
   burn, Monte Carlo, **hedge effectiveness** (rows tagged *Exposure* vs *Hedge / trade*, same paths for both books),
   and delta→strike / premium→IV tools.

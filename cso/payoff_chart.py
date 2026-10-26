@@ -20,14 +20,30 @@ def _marks(xs, labels, color, dash, text_dy=2):
     return [rule, text]
 
 
+def _replay_layers(replays, x_scale, y_scale):
+    """One dot per prior year on the combined line (green where the strategy ends up ahead, red behind), labelled."""
+    df = pd.DataFrame(list(replays), columns=["year", "x", "y"])
+    df["result"] = np.where(df["y"] >= 0, "gain", "loss")
+    x = alt.X("x:Q", scale=x_scale)
+    y = alt.Y("y:Q", scale=y_scale)
+    dots = alt.Chart(df).mark_point(filled=True, size=110, stroke="white", strokeWidth=1.5, opacity=1, clip=True).encode(
+        x=x, y=y,
+        fill=alt.Fill("result:N", scale=alt.Scale(domain=["gain", "loss"], range=[GREEN, RED]), legend=None),
+        tooltip=[alt.Tooltip("year:N", title="Prior year's move"), alt.Tooltip("x:Q", title="Spread if repeated", format=".2f"),
+                 alt.Tooltip("y:Q", title="P&L ($)", format="$,.0f")])
+    labels = alt.Chart(df).mark_text(dy=-13, fontSize=10, color=INK, clip=True).encode(x=x, y=y, text="year:N")
+    return [dots, labels]
+
+
 def payoff_chart(spread, combined, position_only, today=None, *, current: float, strikes=(), breakevens=(),
-                 carry_limit: float | None = None, band: tuple[float, float] | None = None,
+                 carry_limit: float | None = None, band: tuple[float, float] | None = None, replays=(),
                  x_title: str = "Spread level at expiry (near − far, points)", height: int = 420):
     """Layered Altair chart of P&L ($) against the spread level.
 
     ``combined`` is the whole strategy at expiry and carries the green/red fill; ``position_only`` is the same
     position without the option, ``today`` the strategy marked with the model today. ``band`` is the (low, high)
-    the spread has actually traded in, shaded behind everything.
+    the spread has actually traded in, shaded behind everything. ``replays`` are ``(label, spread level, P&L)``
+    dots, one per prior year, for where the strategy would stand if the spread repeated that year's move.
     """
     S = np.asarray(spread, dtype=float)
     c = np.asarray(combined, dtype=float)
@@ -72,4 +88,6 @@ def payoff_chart(spread, combined, position_only, today=None, *, current: float,
     layers += _marks(breakevens, [f"break-even {b:+.2f}" for b in breakevens], MUTED, [2, 3], text_dy=30)
     if carry_limit is not None:
         layers += _marks([carry_limit], ["full carry"], CARRY, [2, 2], text_dy=44)
+    if len(replays):
+        layers += _replay_layers(replays, x_scale, y_scale)
     return alt.layer(*layers).properties(height=height)

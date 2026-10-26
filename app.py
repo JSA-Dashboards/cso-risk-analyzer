@@ -48,8 +48,9 @@ def _fresh_modules() -> None:
 
 _fresh_modules()
 
-from cso import book, carry, massive, pricing, strategy
+from cso import book, carry, massive, pricing, seasonal, strategy
 from cso.payoff_chart import payoff_chart
+from cso.seasonal_chart import seasonal_chart
 from cso.auth import require_password
 from cso.disclosure import render_disclosure
 
@@ -81,6 +82,8 @@ NEAR_FAR, FAR_NEAR = "Near − far", "Far − near"
 SPREAD_COLS = ["Spread", "Near", "Far", "Near price", "Far price", "Spread level", "Spread vol", "Full carry",
                "Convention", "Vol source", "Near vol %", "Far vol %", "Corr"]
 LEG_COLS = ["Vol source", "Near vol %", "Far vol %", "Corr"]
+CURVE_MONTHS = 10                                      # contract months the leg picker offers
+SEASONAL_WINDOWS = {"3M": 91, "6M": 183, "1Y": 365}   # days before the near contract's expiry the seasonal chart shows
 
 
 def _eighth(x: float) -> float:
@@ -172,6 +175,18 @@ def _cached_quotes(tickers: tuple, _key: str) -> dict:
 def _cached_histories(tickers: tuple, _key: str) -> dict:
     """Daily settlements for each contract. Each call takes seconds and bars change once a day, so cache hard."""
     return massive.fetch_histories(_key, tickers)
+
+
+@st.cache_data(ttl="1h", show_spinner="Loading the contract list…")
+def _cached_listing(product: str, as_of: str, _key: str) -> list:
+    """The listed single-month contracts of a product as (ticker, last trading day). It changes about once a day."""
+    return massive.fetch_contracts(_key, product, date.fromisoformat(as_of))
+
+
+@st.cache_data(ttl="6h", show_spinner="Loading earlier years of this spread (about 20 seconds the first time)…")
+def _cached_prior_histories(tickers: tuple, _key: str) -> dict:
+    """Daily settlements for every earlier contract the seasonal overlay reads, fetched together."""
+    return massive.fetch_histories(_key, tickers, max_workers=6)
 
 
 @st.cache_data(ttl="1h", show_spinner=False)
@@ -371,8 +386,10 @@ for _, r in spreads_df.iterrows():
         corr=_num(r.get("Corr")), near_minus_far=_txt(r.get("Convention"), NEAR_FAR) != FAR_NEAR)
 if not spreads:
     st.info("Add a spread to begin: a name, the near and far futures prices (or the spread's own price) and a "
-            "spread vol. Or reload the example from the sidebar.")
-    st.stop()
+            "spread vol. Or reload the example from the sidebar." +
+            (" The Strategy builder below can pick its spread from the live curve instead." if _has_key else ""))
+    if not _has_key:
+        st.stop()           # nothing below can work without a spread, or the feed to pick one from
 
 summary = []
 for s in spreads.values():
@@ -380,12 +397,13 @@ for s in spreads.values():
     sens = None if dv is None else (s.derived_vol(dcorr=-0.01) - s.derived_vol(dcorr=0.01)) / 2
     summary.append({"Spread": s.id, "Level": s.level(), "Spread vol used": s.vol(),
                     "Legs-implied vol": dv, "Δ per ±0.01 corr": sens})
-st.dataframe(pd.DataFrame(summary), hide_index=True, width="content", column_config={
-    "Level": st.column_config.NumberColumn(format="%.2f"),
-    "Spread vol used": st.column_config.NumberColumn(format="%.2f"),
-    "Legs-implied vol": st.column_config.NumberColumn(format="%.2f", help="Diagnostic only unless Vol source = Legs"),
-    "Δ per ±0.01 corr": st.column_config.NumberColumn(format="±%.2f", help="How far the legs-implied vol moves for "
-                                                                           "a 0.01 change in correlation")})
+if summary:
+    st.dataframe(pd.DataFrame(summary), hide_index=True, width="content", column_config={
+        "Level": st.column_config.NumberColumn(format="%.2f"),
+        "Spread vol used": st.column_config.NumberColumn(format="%.2f"),
+        "Legs-implied vol": st.column_config.NumberColumn(format="%.2f", help="Diagnostic only unless Vol source = Legs"),
+        "Δ per ±0.01 corr": st.column_config.NumberColumn(format="±%.2f", help="How far the legs-implied vol moves for "
+                                                                               "a 0.01 change in correlation")})
 for row in summary:
     d, u = row["Legs-implied vol"], row["Spread vol used"]
     if d and abs(d - u) / u > 0.25 and spreads[row["Spread"]].vol_source == "Direct":
@@ -512,26 +530,105 @@ def _no_book() -> bool:
     return True
 
 
+def _pick_from_curve(key: str, product: str):
+    """The leg picker: choose the near and far contract from the live curve.
+
+    Returns (spread, near contract, far contract, where the vol default came from), or None with the reason shown.
+    """
+    try:
+        months = massive.live_months(_cached_listing(product, TODAY.isoformat(), key), TODAY, CURVE_MONTHS)
+        quotes = _cached_quotes(tuple(t for t, _ in months), key)
+    except massive.MassiveError as exc:
+        st.warning(f"Could not load the live curve: {exc}.")
+        return None
+    curve = massive.build_curve(months, quotes, CURVE_MONTHS)
+    if len(curve) < 2:
+        st.warning("Fewer than two priced contract months came back for this market, so there is no spread to pick.")
+        return None
+    by_label = {c.label: c for c in curve}
+    labels = list(by_label)
+    soon = next((m for m in labels[:-1] if by_label[m].expiry >= TODAY + timedelta(days=14)), labels[0])
+    show = lambda m: f"{m} · {by_label[m].price:g}"
+    c1, c2 = st.columns(2)
+    near_label = c1.selectbox("Near contract", labels[:-1], index=labels.index(soon), format_func=show,
+                              key=f"cso_st_near_{product}_{labels[0]}",
+                              help="The nearby future of the spread. The list is the live curve, nearest month first.")
+    later = [m for m in labels if by_label[m].expiry > by_label[near_label].expiry]
+    far_label = c2.selectbox("Far contract", later, format_func=show,
+                             key=f"cso_st_far_{product}_{labels[0]}_{near_label}",
+                             help="The deferred future. Only months after the near contract are offered.")
+    near, far = by_label[near_label], by_label[far_label]
+    st.caption(f"{near_label} {near.price:g} − {far_label} {far.price:g} = **{near.price - far.price:+.2f}** points")
+    with st.expander("The live curve"):
+        rows = [{"Contract": c.label, "Last trade": c.expiry, "Days": (c.expiry - TODAY).days, "Price": c.price,
+                 "To the next month": c.price - curve[i + 1].price if i + 1 < len(curve) else None}
+                for i, c in enumerate(curve)]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="content", column_config={
+            "Last trade": st.column_config.DateColumn(format="MMM D, YYYY"),
+            "Price": st.column_config.NumberColumn(format="%.2f"),
+            "To the next month": st.column_config.NumberColumn(
+                format="%+.2f", help="This month less the next month: the calendar spread between neighbours (near − far).")})
+        stamps = [c.quote.as_of for c in curve if c.quote.as_of is not None]
+        st.caption("Prices from Massive" + (" (delayed)" if any(c.quote.delayed for c in curve) else "") +
+                   (f", last trade {_clock(max(stamps))}" if stamps else "") + ".")
+
+    hs = _cached_histories((near.ticker, far.ticker), key)
+    realized = massive.realized_vol(massive.spread_history(hs.get(near.ticker, pd.Series(dtype=float)),
+                                                           hs.get(far.ticker, pd.Series(dtype=float)), None))
+    mine = next((s for s in spreads.values()
+                 if (s.near_label.lower(), s.far_label.lower()) == (near_label.lower(), far_label.lower())), None)
+    if mine is not None:
+        vol, note = mine.vol(), "your book's vol for this pair"
+    elif realized is not None:
+        vol, note = round(realized, 1), "the spread's realized vol over its last 60 sessions"
+    else:
+        vol, note = 20.0, "a provisional 20, since there is no history to measure one from"
+    sp = book.Spread(id=f"{near_label}/{far_label}", near_label=near_label, far_label=far_label, near_px=near.price,
+                     far_px=far.price, spread_vol=vol)
+    return sp, near, far, note
+
+
 @st.fragment
 def tab_strategy():
-    sid = st.selectbox("Spread", list(spreads), key="cso_st_spread")
-    sp = spreads[sid]
-    level = sp.level()
     key = massive.api_key_from(st.secrets)
     product = massive.PRODUCT_CODES.get(commodity)
-    near_t = massive.ticker_for(product, sp.near_label, val_date)
-    far_t = massive.ticker_for(product, sp.far_label, val_date)
+    sources = (["My book"] if spreads else []) + (["Live curve"] if key and product else [])
+    if not sources:
+        st.info("Add a spread in step 1 to build a strategy on it.")
+        return
+    src = sources[0]
+    if len(sources) > 1:
+        src = st.segmented_control(
+            "Spread from", sources, default=sources[0], key="cso_st_src",
+            help="My book: a spread from step 1. Live curve: pick the near and far contract from the market-data feed's "
+                 "current curve, with live prices.") or sources[0]
 
-    quotes = {}
-    if key and near_t and far_t:
-        try:
-            quotes = _cached_quotes((near_t, far_t), key)
-        except massive.MassiveError:
-            quotes = {}
+    vol_note = None
+    if src == "Live curve":
+        picked = _pick_from_curve(key, product)
+        if picked is None:
+            return
+        sp, near_c, far_c, vol_note = picked
+        sid, near_t, far_t = sp.id, near_c.ticker, far_c.ticker
+        quotes = {near_t: near_c.quote, far_t: far_c.quote}
+        expiries = {near_t: near_c.expiry, far_t: far_c.expiry}          # from the listing, not the snapshot's optional field
+    else:
+        sid = st.selectbox("Spread", list(spreads), key="cso_st_spread")
+        sp = spreads[sid]
+        near_t = massive.ticker_for(product, sp.near_label, val_date)
+        far_t = massive.ticker_for(product, sp.far_label, val_date)
+        quotes = {}
+        if key and near_t and far_t:
+            try:
+                quotes = _cached_quotes((near_t, far_t), key)
+            except massive.MassiveError:
+                quotes = {}
+        expiries = {t: q.expiry for t, q in quotes.items()}
+    level = sp.level()
 
     # ---- where the spread sits against full carry (the Cost of Carry calculator's math)
     near_px = sp.near_px if sp.near_px is not None else (quotes[near_t].price if near_t in quotes else None)
-    near_exp, far_exp = (quotes[near_t].expiry if near_t in quotes else None), (quotes[far_t].expiry if far_t in quotes else None)
+    near_exp, far_exp = expiries.get(near_t), expiries.get(far_t)
     mkt = carry.MARKETS[product]
     days_default = (far_exp - near_exp).days if near_exp and far_exp and far_exp > near_exp else 90
     storage_default = (carry.storage_rate(product, near_exp, far_exp) if near_exp and far_exp else mkt[0]) * mkt[1]
@@ -571,10 +668,11 @@ def tab_strategy():
             st.markdown(f":{carry.BUCKET_COLORS[carry.bucket(pct)]}-badge[{pct:.0%} of full carry]")
 
     # ---- the range the spread has actually traded in
-    band = None
+    band, near_h, far_h = None, pd.Series(dtype=float), pd.Series(dtype=float)
     if key and near_t and far_t:
         hs = _cached_histories((near_t, far_t), key)
-        hist = massive.spread_history(hs.get(near_t, pd.Series(dtype=float)), hs.get(far_t, pd.Series(dtype=float)), 365, val_date)
+        near_h, far_h = hs.get(near_t, near_h), hs.get(far_t, far_h)
+        hist = massive.spread_history(near_h, far_h, 365, val_date)
         if not hist.empty:
             hist = hist if sp.near_minus_far else -hist
             band = (float(hist.min()), float(hist.max()))
@@ -603,7 +701,8 @@ def tab_strategy():
     expiry = o3.date_input("CSO expiry", val_date + timedelta(days=36), key="cso_st_expiry",
                            help="CSOs expire before the nearby future does: enter the series' actual date.")
     vol = o4.number_input("Spread vol (pts/yr)", 0.1, 500.0, float(round(sp.vol(), 2)), 0.5,
-                          key=f"cso_st_vol_{sid}_{round(sp.vol(), 2)}")
+                          key=f"cso_st_vol_{sid}_{round(sp.vol(), 2)}",
+                          help=None if vol_note is None else f"Starts at {vol_note}. Overwrite it with the vol you are quoted.")
     T = max((expiry - val_date).days, 0) / 365.0
     model_prem = float(pricing.price(opt == "Call", level, strike, vol, T, rate))
     q1, q2 = st.columns([1, 2])
@@ -621,18 +720,49 @@ def tab_strategy():
     held = list(legs)
     legs.append(strategy.Leg(strategy.PUT if opt == "Put" else strategy.CALL, opt_qty, strike, premium, expiry, vol))
 
-    # ---- payoff: green where it gains, red where it loses
-    half = st.number_input("Chart half-width (points)", 5.0, 300.0, 40.0, 5.0, key="cso_st_w")
+    # ---- the chart's own controls, and the seasonal overlay's (the earlier years are read before the chart is drawn,
+    # because their replays are dots on it)
+    k1, k2, k3, k4 = st.columns([1, 1.4, 1, 1.6], vertical_alignment="bottom")
+    half = k1.number_input("Chart half-width (points)", 5.0, 300.0, 40.0, 5.0, key="cso_st_w")
+    show_seas = k2.toggle("Seasonal overlay", value=False, key="cso_st_seas", disabled=not key,
+                          help="Lays the same pair in earlier years over this one, lined up by days to the near "
+                               "contract's expiry, and replays each year's move over the option's life on the chart." if key
+                          else "Needs the market-data feed (a Massive key).")
+    seas, window = None, 0
+    if show_seas and key:
+        if near_exp is None:
+            st.info("The seasonal overlay needs the near contract's expiry from the feed, which did not come back for this contract.")
+        else:
+            sign = 1.0 if sp.near_minus_far else -1.0
+            prior = _cached_prior_histories(seasonal.tickers_needed(near_t, far_t, seasonal.MAX_PRIOR_YEARS), key)
+            all_years = seasonal.build_years(prior, near_t, far_t, near_exp, seasonal.MAX_PRIOR_YEARS, sign=sign, window=400)
+            if not all_years:
+                st.info("No earlier year of this pair has daily history in the feed (it begins in autumn 2021).")
+            else:
+                n_years = k3.number_input("Earlier years", 1, len(all_years), len(all_years), key=f"cso_st_years_{len(all_years)}")
+                window = SEASONAL_WINDOWS[k4.segmented_control("Season", list(SEASONAL_WINDOWS), default="6M",
+                                                               key="cso_st_win") or "6M"]
+                seas = {"years": all_years[:int(n_years)], "sign": sign}
+
     lo, hi = min(level - half, strike - 10), max(level + half, strike + 10)
     S = strategy.grid(legs, mult, lo, hi)
     combined = strategy.at_expiry(legs, S, mult)
+    replays, dots = [], []
+    if seas:
+        replays = seasonal.replays(seas["years"], (val_date - near_exp).days, (expiry - near_exp).days)
+        dots = [(f"'{str(r.year)[-2:]}", level + r.change, float(strategy.at_expiry(legs, level + r.change, mult)))
+                for r in replays if lo <= level + r.change <= hi]
+
+    # ---- payoff: green where it gains, red where it loses
     chart = payoff_chart(
         S, combined, strategy.at_expiry(held, S, mult), strategy.value_on(legs, S, mult, vol, rate, val_date),
         current=level, strikes=[(strike, f"strike {strike:+g}")], breakevens=strategy.breakevens(legs, mult),
-        carry_limit=carry_limit if carry_limit is not None and lo <= carry_limit <= hi else None, band=band)
+        carry_limit=carry_limit if carry_limit is not None and lo <= carry_limit <= hi else None, band=band, replays=dots)
     st.altair_chart(chart, width="stretch")
     st.caption("**Green** = spread levels where the strategy makes money at expiry, **red** = where it loses. Solid line: "
-               "at expiry. Thin blue line: today's model value. Dashed grey: the position without the option.")
+               "at expiry. Thin blue line: today's model value. Dashed grey: the position without the option."
+               + (" Dots: where the strategy would end if the spread repeated each earlier year's move (see the seasonal "
+                  "overlay below)." if dots else ""))
 
     sm = strategy.summary(legs, mult)
     m = st.columns(5)
@@ -643,7 +773,63 @@ def tab_strategy():
     m[3].metric("Break-even", ", ".join(f"{b:+.2f}" for b in sm["breakevens"]) or "—")
     if carry_limit is not None:
         m[4].metric(f"At full carry ({carry_limit:+.1f})", usd(float(strategy.at_expiry(legs, carry_limit, mult))),
-                help="P&L at expiry if the spread widens all the way to full carry, the practical limit of the downside.")
+                    help="P&L at expiry if the spread widens all the way to full carry, the practical limit of the downside.")
+
+    # ---- the earlier years of this spread, and what repeating each one would have done
+    if seas:
+        st.markdown("#### Seasonal overlay")
+        years = seas["years"]
+        view = {y.year: seasonal.on_calendar(y.by_dte[y.by_dte.index >= -window], near_exp) for y in years}
+        live = seasonal.current_by_dte(near_h, far_h, near_exp, sign=seas["sign"], window=window)
+        avg = seasonal.average(years, window)
+        fig = seasonal_chart(
+            seasonal.on_calendar(live, near_exp) if len(live) else None, view,
+            seasonal.on_calendar(avg, near_exp) if avg is not None else None,
+            near_expiry=near_exp, window=window, today=val_date, option_expiry=expiry, strike=strike,
+            breakevens=strategy.breakevens(legs, mult), entry=entry if base != "No position" else None,
+            carry_limit=carry_limit, y_title=f"Spread level ({sp.near_label} − {sp.far_label}, points)"
+            if sp.near_minus_far else f"Spread level ({sp.far_label} − {sp.near_label}, points)")
+        if fig is not None:
+            st.altair_chart(fig, width="stretch")
+        starts = [y.year for y in years if y.by_dte.index.min() > -window + 14]
+        st.caption(
+            f"{len(years)} earlier year{'s' if len(years) != 1 else ''} from the feed's daily history, which begins in autumn "
+            f"2021. Each year is the same pair, lined up by days to the near contract's last trading day, so the same "
+            f"point of the season is in the same place on the x-axis."
+            + (f" {', '.join(str(y) for y in starts)} start{'s' if len(starts) == 1 else ''} partway through the "
+               f"window because that is where the feed's history for it begins." if starts else ""))
+        if not replays:
+            st.info("No earlier year has prices near both today's date and the option's expiry in its season, so there is "
+                    "nothing to replay. The option's expiry must also fall before the near contract's last trading day.")
+        else:
+            dy = None if far_exp is None else far_exp.year - near_exp.year
+            letters = (massive.split_ticker(near_t), massive.split_ticker(far_t))
+            rows = []
+            for r in replays:
+                lvl = level + r.change
+                name = str(r.year)
+                if None not in letters and dy is not None:
+                    name = (f"{massive.MONTH_NAMES[letters[0][1]]}{r.year % 100:02d}/"
+                            f"{massive.MONTH_NAMES[letters[1][1]]}{(r.year + dy) % 100:02d}")
+                row = {"Earlier year": name, "Then": r.then, "At expiry": r.at_expiry, "Move": r.change, "If repeated": lvl}
+                if held:
+                    row["Position only"] = float(strategy.at_expiry(held, lvl, mult))
+                row["Strategy"] = float(strategy.at_expiry(legs, lvl, mult))
+                rows.append(row)
+            rt = pd.DataFrame(rows)
+            money = [c for c in ("Position only", "Strategy") if c in rt]
+            st.markdown("**If the spread repeated each earlier year's move** between the days matching today and the option's expiry")
+            st.caption("Then = that year's spread on the day matching today; At expiry = on the day matching the option's "
+                       "expiry; If repeated = today's level plus that move.")
+            st.dataframe(rt.style.apply(_heat, subset=money, axis=None)
+                         .format({"Then": "{:+.2f}", "At expiry": "{:+.2f}", "Move": "{:+.2f}", "If repeated": "{:+.2f}",
+                                  **{c: usd for c in money}}),
+                         hide_index=True, width="stretch")
+            ahead = sum(1 for v in rt["Strategy"] if v > 0)
+            st.caption(
+                f"Strategy ahead in {ahead} of {len(rt)} replays; the average move is {rt['Move'].mean():+.2f} points. "
+                "Each move is added to today's level, so it assumes the spread moves in points the way it did then. "
+                f"{len(rt)} years is a small sample: this is a scenario read off history, not a forecast.")
 
     # ---- the same thing as a table, shaded the same way
     step = max(1.0, float(round(half / 8)))
@@ -848,6 +1034,9 @@ def tab_hedge():
 
 @st.fragment
 def tab_tools():
+    if not spreads:
+        st.info("Add a spread in step 1 to use the strike and IV tools.")
+        return
     sp_id = st.selectbox("Spread", list(spreads), key="cso_tool_spread")
     sp = spreads[sp_id]
     S = sp.level()
@@ -929,6 +1118,12 @@ with st.expander("Model and contract assumptions"):
 - **Strategy builder:** P&L is measured against what the legs cost (a spread future against its entry level, an
   option against its premium), at expiry and marked with the model today. Full carry follows the Cost of Carry
   calculator: CME maximum storage plus interest at fed funds + 2.25%, between the two contracts' expiries.
+- **Live curve and seasonal overlay:** the Strategy builder can take its spread from the feed's current curve (the
+  nearest listed months, with prices). Its vol starts at your book's vol for the same pair, else at the spread's
+  realized vol over the last 60 sessions. The seasonal overlay reads the same pair in earlier years from the feed's
+  daily history (autumn 2021 on), lined up by days to the near contract's last trading day. The dots on the payoff
+  chart add each earlier year's move between the days matching today and the option's expiry to today's level: a
+  scenario from a handful of years, not a forecast.
 - **Check before trading:** the expiry date for each series, the listed strikes and the contract size, against
   CME's current contract specifications and expiry calendar.
         """)
