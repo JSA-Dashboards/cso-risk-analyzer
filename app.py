@@ -1,3 +1,4 @@
+import ast
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -8,6 +9,44 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _fresh_modules() -> None:
+    """Make a push take effect without a Reboot.
+
+    Streamlit Cloud re-reads this script after a push but keeps the project modules it already imported, so a
+    changed or newly extended cso/*.py would keep running its old code (an AttributeError on a function that
+    only exists in the new file). Reload the package when its files changed since this process last looked. On
+    the first run in a process there is no earlier signature, so look for a loaded module that lacks a name its
+    file now defines, which is what a stale module after a push looks like. Does nothing in a fresh process.
+    """
+    pkg = Path(__file__).resolve().parent / "cso"
+    files = sorted(pkg.glob("*.py"))
+    sig = tuple((p.name, p.stat().st_mtime_ns) for p in files)
+    previous = getattr(sys, "_cso_code_sig", None)
+    stale = previous is not None and previous != sig
+    if previous is None:
+        for p in files:
+            mod = sys.modules.get("cso" if p.stem == "__init__" else f"cso.{p.stem}")
+            if mod is None:
+                continue
+            try:
+                body = ast.parse(p.read_text(encoding="utf-8")).body
+            except (OSError, SyntaxError):
+                continue
+            defined = {n.name for n in body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+            defined |= {t.id for n in body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+            if any(not hasattr(mod, name) for name in defined):
+                stale = True
+                break
+    if stale:
+        for name in [n for n in sys.modules if n == "cso" or n.startswith("cso.")]:
+            sys.modules.pop(name, None)
+        st.cache_data.clear()
+    sys._cso_code_sig = sig
+
+
+_fresh_modules()
 
 from cso import book, carry, massive, pricing, strategy
 from cso.payoff_chart import payoff_chart
