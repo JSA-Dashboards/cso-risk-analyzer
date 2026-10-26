@@ -12,9 +12,11 @@ from __future__ import annotations
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
+import pandas as pd
 import requests
 
 BASE_URL = "https://api.massive.com"
@@ -31,6 +33,7 @@ PRODUCT_CODES = {
 MONTH_LETTERS = {"jan": "F", "feb": "G", "mar": "H", "apr": "J", "may": "K", "jun": "M",
                  "jul": "N", "aug": "Q", "sep": "U", "oct": "V", "nov": "X", "dec": "Z"}
 LETTER_MONTH = {letter: i + 1 for i, letter in enumerate(MONTH_LETTERS.values())}
+MONTH_CODES = "FGHJKMNQUVXZ"
 
 _NAME = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-/'_.]*(\d{1,4})?$", re.I)
 _CODE = re.compile(r"^(?:[A-Z]{1,2})?([FGHJKMNQUVXZ])[\s\-/'_.]*(\d{1,4})$", re.I)
@@ -114,9 +117,9 @@ def _price_of(result: dict) -> tuple[float, str] | None:
     return None
 
 
-def _get(url: str, tickers: list[str], api_key: str, timeout: float) -> dict:
+def _request(url: str, params: dict, api_key: str, timeout: float) -> dict:
     try:
-        resp = requests.get(url, params={"ticker.any_of": ",".join(tickers)}, timeout=timeout,
+        resp = requests.get(url, params=params, timeout=timeout,
                             headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
     except requests.RequestException as exc:
         raise MassiveError(f"could not reach the market-data service ({type(exc).__name__})") from None
@@ -132,19 +135,23 @@ def _get(url: str, tickers: list[str], api_key: str, timeout: float) -> dict:
     return payload
 
 
+def _retrying(url: str, params: dict, api_key: str, timeout: float) -> dict:
+    """One quiet retry covers a gateway hiccup or a rate limit; a rejected key fails at once."""
+    try:
+        return _request(url, params, api_key, timeout)
+    except MassiveError as first:
+        if "rejected the API key" in str(first):
+            raise
+        time.sleep(0.8)
+        return _request(url, params, api_key, timeout)
+
+
 def fetch_snapshot(api_key: str, tickers, base_url: str = BASE_URL, timeout: float = 12.0) -> dict[str, Quote]:
     """Latest price for each ticker that has one. One quiet retry covers a gateway hiccup or rate limit."""
     wanted = sorted({t for t in tickers if t})
     if not wanted:
         return {}
-    url = f"{base_url}/futures/v1/snapshot"
-    try:
-        payload = _get(url, wanted, api_key, timeout)
-    except MassiveError as first:
-        if "rejected the API key" in str(first):
-            raise
-        time.sleep(0.8)
-        payload = _get(url, wanted, api_key, timeout)
+    payload = _retrying(f"{base_url}/futures/v1/snapshot", {"ticker.any_of": ",".join(wanted)}, api_key, timeout)
 
     quotes: dict[str, Quote] = {}
     for result in payload.get("results") or []:
@@ -163,3 +170,62 @@ def fetch_snapshot(api_key: str, tickers, base_url: str = BASE_URL, timeout: flo
             expiry = None
         quotes[ticker] = Quote(ticker, price, source, as_of, expiry, str(trade.get("timeframe", "")).upper() == "DELAYED")
     return quotes
+
+
+# ----------------------------------------------------------------------------- history and the fed-funds future
+def fetch_history(api_key: str, ticker: str, base_url: str = BASE_URL, timeout: float = 60.0) -> pd.Series:
+    """Daily settlement history for one contract, indexed by trading date, ascending.
+
+    Falls back to the session close where the settlement is missing or zero (today's bar has no settlement
+    until it settles). Each call takes several seconds, so callers cache it.
+    """
+    payload = _retrying(f"{base_url}/futures/v1/aggs/{ticker}", {"resolution": "1session", "limit": 50000},
+                        api_key, timeout)
+    rows: dict[date, float] = {}
+    for bar in payload.get("results") or []:
+        day = bar.get("session_end_date")
+        price = bar.get("settlement_price") or bar.get("close")
+        if not day or not price:
+            continue
+        rows[date.fromisoformat(str(day)[:10])] = float(price)
+    return pd.Series(rows, dtype=float).sort_index() if rows else pd.Series(dtype=float)
+
+
+def fetch_histories(api_key: str, tickers, base_url: str = BASE_URL, max_workers: int = 4) -> dict[str, pd.Series]:
+    """Several contracts in parallel. A contract whose call fails comes back empty rather than sinking the rest."""
+    wanted = sorted({t for t in tickers if t})
+
+    def one(ticker: str) -> pd.Series:
+        try:
+            return fetch_history(api_key, ticker, base_url)
+        except MassiveError:
+            return pd.Series(dtype=float)
+
+    if not wanted:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(wanted))) as pool:
+        return dict(zip(wanted, pool.map(one, wanted)))
+
+
+def spread_history(near: pd.Series, far: pd.Series, days: int | None = 365, today: date | None = None) -> pd.Series:
+    """near - far over the sessions both contracts traded, optionally only the last ``days`` days."""
+    if near.empty or far.empty:
+        return pd.Series(dtype=float)
+    spread = (near - far).dropna()
+    if days and today is not None:
+        spread = spread[spread.index >= today - timedelta(days=days)]
+    return spread
+
+
+def fed_funds_pct(api_key: str, as_of: date, base_url: str = BASE_URL) -> tuple[float, str]:
+    """Front-month 30-day fed funds future (ZQ, quoted 100 - rate) as an implied rate: (percent, ticker)."""
+    tickers, year, month = [], as_of.year, as_of.month
+    for _ in range(3):
+        tickers.append(f"ZQ{MONTH_CODES[month - 1]}{year % 10}")
+        month, year = (1, year + 1) if month == 12 else (month + 1, year)
+    quotes = fetch_snapshot(api_key, tickers, base_url)
+    for ticker in tickers:                                   # nearest first; skip a contract that has expired
+        q = quotes.get(ticker)
+        if q is not None and (q.expiry is None or q.expiry >= as_of):
+            return round(100.0 - q.price, 3), ticker
+    raise MassiveError("no fed-funds future came back with a price")

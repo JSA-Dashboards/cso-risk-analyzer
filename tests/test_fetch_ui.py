@@ -44,13 +44,14 @@ def _with_feed(monkeypatch, quotes=None, error=None):
     monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
     calls = []
 
-    def fake(key, tickers, **kwargs):
+    def fake(key, tickers, *args, **kwargs):
         calls.append((key, tuple(tickers)))
         if error:
             raise massive.MassiveError(error)
         return {t: quotes[t] for t in tickers if t in quotes}
 
     monkeypatch.setattr(massive, "fetch_snapshot", fake)
+    monkeypatch.setattr(massive, "fetch_histories", lambda key, tickers, **kw: {})     # the Strategy tab asks for history too
     return calls
 
 
@@ -68,7 +69,7 @@ def test_fetch_fills_near_and_far_from_the_feed(monkeypatch):
     assert not at.exception
     df = at.session_state["cso_spreads_df"]
     assert (df.loc[0, "Near price"], df.loc[0, "Far price"]) == (478.25, 491.0)
-    assert calls == [("test-key", ("ZCH7", "ZCZ6"))]                      # Dec26/Mar27 -> ZCZ6/ZCH7, key passed through
+    assert ("test-key", ("ZCH7", "ZCZ6")) in calls                         # Dec26/Mar27 -> ZCZ6/ZCH7, key passed through
     kind, text = at.session_state["cso_fetch_note"]
     assert kind == "ok" and "ZCZ6 478.25" in text and "ZCH7 491" in text and "delayed" in text
     assert "test-key" not in text
@@ -104,9 +105,11 @@ def test_unreadable_contract_labels_are_explained_without_a_call(monkeypatch):
     df["Near"], df["Far"] = "front", "back"
     at.session_state["cso_spreads_df"] = df
     at.run()
+    calls.clear()                                             # only what the button itself does from here
     _button(at).click().run()
     kind, text = at.session_state["cso_fetch_note"]
-    assert kind == "warn" and "contract labels" in text and calls == []
+    # no price lookup for the unreadable spread (the Strategy tab's fed-funds read of the ZQ future is a different call)
+    assert kind == "warn" and "contract labels" in text and [c for c in calls if not c[1][0].startswith("ZQ")] == []
 
 
 def test_a_typed_spread_level_is_flagged_because_it_wins(monkeypatch):

@@ -9,7 +9,8 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cso import book, massive, pricing
+from cso import book, carry, massive, pricing, strategy
+from cso.payoff_chart import payoff_chart
 from cso.auth import require_password
 from cso.disclosure import render_disclosure
 
@@ -126,6 +127,18 @@ def _apply_spread_vol(sid: str, vol: float) -> None:
 def _cached_quotes(tickers: tuple, _key: str) -> dict:
     """One Massive snapshot per two minutes for a set of contracts (the key is not part of the cache key)."""
     return massive.fetch_snapshot(_key, tickers)
+
+
+@st.cache_data(ttl="6h", show_spinner="Loading the spread's recent history…")
+def _cached_histories(tickers: tuple, _key: str) -> dict:
+    """Daily settlements for each contract. Each call takes seconds and bars change once a day, so cache hard."""
+    return massive.fetch_histories(_key, tickers)
+
+
+@st.cache_data(ttl="1h", show_spinner=False)
+def _cached_fed_funds(as_of: str, _key: str) -> tuple:
+    """Front-month fed-funds future as a rate: (percent, ticker). It moves in basis points."""
+    return massive.fed_funds_pct(_key, date.fromisoformat(as_of))
 
 
 def _clock(ts: datetime) -> str:
@@ -423,14 +436,14 @@ for i, r in pos_df.iterrows():
 for p in problems:
     st.warning(p)
 if not positions:
-    st.info("Add at least one position to see risk.")
-    st.stop()
+    st.info("Add at least one position in step 3 for the portfolio tabs. The Strategy builder works without one.")
 if any(p.expiry and p.expiry <= val_date for p in positions):
     st.warning("Some options are at or past expiry on the valuation date — they're valued at intrinsic.")
 used = {p.spread_id: spreads[p.spread_id] for p in positions}
 exp_dates = [p.expiry for p in positions if p.expiry and p.expiry > val_date]
 max_h = max((min(exp_dates) - val_date).days if exp_dates else 30, 1)
-st.download_button("Download book (CSV)", pos_df.to_csv(index=False), "cso_book.csv", mime="text/csv")
+if positions:
+    st.download_button("Download book (CSV)", pos_df.to_csv(index=False), "cso_book.csv", mime="text/csv")
 
 
 def _heat(df):
@@ -445,13 +458,173 @@ def _heat(df):
 
 
 # --------------------------------------------------------------------------- tabs
-t_book, t_grid, t_vol, t_theta, t_mc, t_hedge, t_tools = st.tabs(
-    ["Book & Greeks", "Spread moves", "Vol shocks", "Theta burn", "Monte Carlo", "Hedge effectiveness",
-     "Strike & IV tools"], on_change="rerun")
+for _k in [k for k in st.session_state if str(k).startswith("cso_st_")]:
+    st.session_state[_k] = st.session_state[_k]      # lazy tabs drop a closed tab's widgets; this keeps the builder's inputs
+
+t_strategy, t_book, t_grid, t_vol, t_theta, t_mc, t_hedge, t_tools = st.tabs(
+    ["Strategy builder", "Book & Greeks", "Spread moves", "Vol shocks", "Theta burn", "Monte Carlo",
+     "Hedge effectiveness", "Strike & IV tools"], on_change="rerun")
+
+
+def _no_book() -> bool:
+    if positions:
+        return False
+    st.info("Add at least one position in step 3 to see this. The Strategy builder and the IV tools work without one.")
+    return True
+
+
+@st.fragment
+def tab_strategy():
+    sid = st.selectbox("Spread", list(spreads), key="cso_st_spread")
+    sp = spreads[sid]
+    level = sp.level()
+    key = massive.api_key_from(st.secrets)
+    product = massive.PRODUCT_CODES.get(commodity)
+    near_t = massive.ticker_for(product, sp.near_label, val_date)
+    far_t = massive.ticker_for(product, sp.far_label, val_date)
+
+    quotes = {}
+    if key and near_t and far_t:
+        try:
+            quotes = _cached_quotes((near_t, far_t), key)
+        except massive.MassiveError:
+            quotes = {}
+
+    # ---- where the spread sits against full carry (the Cost of Carry calculator's math)
+    near_px = sp.near_px if sp.near_px is not None else (quotes[near_t].price if near_t in quotes else None)
+    near_exp, far_exp = (quotes[near_t].expiry if near_t in quotes else None), (quotes[far_t].expiry if far_t in quotes else None)
+    mkt = carry.MARKETS[product]
+    days_default = (far_exp - near_exp).days if near_exp and far_exp and far_exp > near_exp else 90
+    storage_default = (carry.storage_rate(product, near_exp, far_exp) if near_exp and far_exp else mkt[0]) * mkt[1]
+    rate_default, rate_note = carry.FALLBACK_ANNUAL_RATE_PCT, f"fed funds + {carry.FED_FUNDS_SPREAD_PCT}% (live read unavailable: fallback)"
+    if key:
+        try:
+            ff, ff_ticker = _cached_fed_funds(val_date.isoformat(), key)
+            rate_default = round(ff + carry.FED_FUNDS_SPREAD_PCT, 3)
+            rate_note = f"{ff:.2f}% fed funds ({ff_ticker}) + {carry.FED_FUNDS_SPREAD_PCT}%"
+        except massive.MassiveError:
+            pass
+    with st.expander("Carry assumptions"):
+        a1, a2, a3 = st.columns(3)
+        days = a1.number_input("Days between the two expiries", 1, 600, int(days_default), key=f"cso_st_days_{sid}_{days_default}")
+        storage = a2.number_input(f"Storage ({mkt[2]})", 0.0, 50.0, float(round(storage_default, 5)), format="%.5f",
+                                  key=f"cso_st_storage_{sid}_{round(storage_default, 5)}",
+                                  help="CME maximum storage rate carried under across the spread's window.")
+        rate_pct = a3.number_input("Interest rate %", 0.0, 30.0, float(rate_default), 0.05, key=f"cso_st_rate_{sid}_{rate_default}",
+                                   help=rate_note)
+    spread_nf = level if sp.near_minus_far else -level            # the calculator's convention: near - far
+    carry_limit, fc, pct = None, None, None
+    if near_px:
+        fc = carry.full_carry(near_px, int(days), storage / mkt[1], rate_pct / 100, mkt[1])
+        pct = carry.pct_of_full_carry(spread_nf, fc["full"])
+        carry_limit = -fc["full"] if sp.near_minus_far else fc["full"]
+
+    top = st.columns(4)
+    top[0].metric("Spread level", f"{level:+.2f}", help=f"{sp.near_label} − {sp.far_label}" if sp.near_minus_far else f"{sp.far_label} − {sp.near_label}")
+    top[1].metric("Full carry", "—" if fc is None else f"{fc['full']:.2f}",
+                  help=None if fc is None else f"storage {fc['storage']:.2f} + interest {fc['interest']:.2f} points ({rate_note})")
+    top[2].metric("Spread vol (pts/yr)", f"{sp.vol():.1f}")
+    with top[3]:
+        st.caption("Share of full carry")
+        if pct is None:
+            st.markdown("—")
+        else:
+            st.markdown(f":{carry.BUCKET_COLORS[carry.bucket(pct)]}-badge[{pct:.0%} of full carry]")
+
+    # ---- the range the spread has actually traded in
+    band = None
+    if key and near_t and far_t:
+        hs = _cached_histories((near_t, far_t), key)
+        hist = massive.spread_history(hs.get(near_t, pd.Series(dtype=float)), hs.get(far_t, pd.Series(dtype=float)), 365, val_date)
+        if not hist.empty:
+            hist = hist if sp.near_minus_far else -hist
+            band = (float(hist.min()), float(hist.max()))
+            st.caption(f"Last 12 months ({len(hist)} sessions): low {hist.min():+.2f} on {hist.idxmin():%b %d, %Y}, "
+                       f"high {hist.max():+.2f} on {hist.idxmax():%b %d, %Y}. Shaded blue on the chart.")
+
+    # ---- the position and the option laid over it
+    st.markdown("#### Position and protection")
+    sn, sf = sp.leg_sign()
+    legs_txt = f"{'buy' if sn > 0 else 'sell'} {sp.near_label} / {'buy' if sf > 0 else 'sell'} {sp.far_label}"
+    p1, p2, p3, p4 = st.columns([1.4, 1, 1, 1])
+    base = p1.segmented_control("Position being protected", ["Long spread", "Short spread", "No position"],
+                                default="Long spread", key="cso_st_base",
+                                help=f"Long spread = {legs_txt}. A put protects a long spread against the spread falling; "
+                                     "a call protects a short one.") or "No position"
+    qty = p2.number_input("Contracts", 1, 10000, 10, key="cso_st_qty")
+    entry = p3.number_input("Entry level", value=float(round(level, 2)), step=0.25, format="%.2f", key=f"cso_st_entry_{sid}",
+                            help="Where the spread position was put on. The default is today's level.")
+    opt = p4.segmented_control("Bought option", ["Put", "Call"], default="Put", key="cso_st_opt") or "Put"
+
+    o1, o2, o3, o4 = st.columns(4)
+    default_k = float(np.floor((level - 5) / 5) * 5) if opt == "Put" else float(np.ceil((level + 5) / 5) * 5)
+    strike = o1.number_input("Strike", value=default_k, step=1.0, format="%.1f", key=f"cso_st_strike_{opt}_{sid}",
+                             help="Spread strike in points. CSO strikes are 5 points apart (1 for the nearest spreads).")
+    opt_qty = o2.number_input("Option contracts", 1, 10000, int(qty), key=f"cso_st_optqty_{qty}")
+    expiry = o3.date_input("CSO expiry", val_date + timedelta(days=36), key="cso_st_expiry",
+                           help="CSOs expire before the nearby future does: enter the series' actual date.")
+    vol = o4.number_input("Spread vol (pts/yr)", 0.1, 500.0, float(round(sp.vol(), 2)), 0.5,
+                          key=f"cso_st_vol_{sid}_{round(sp.vol(), 2)}")
+    T = max((expiry - val_date).days, 0) / 365.0
+    model_prem = float(pricing.price(opt == "Call", level, strike, vol, T, rate))
+    q1, q2 = st.columns([1, 2])
+    psrc = q1.segmented_control("Premium", ["Model", "My quote"], default="Model", key="cso_st_psrc") or "Model"
+    if psrc == "My quote":
+        premium = q2.number_input("Premium paid (points)", 0.0, 500.0, float(_eighth(model_prem)), 0.125, format="%.3f",
+                                  key=f"cso_st_prem_{opt}_{strike}_{round(model_prem, 3)}")
+    else:
+        premium = model_prem
+        q2.caption(f"Model price {model_prem:.3f} points = {usd(model_prem * mult * opt_qty)} for {opt_qty} contract(s).")
+
+    legs = []
+    if base != "No position":
+        legs.append(strategy.Leg(strategy.FUTURE, qty if base == "Long spread" else -qty, entry))
+    held = list(legs)
+    legs.append(strategy.Leg(strategy.PUT if opt == "Put" else strategy.CALL, opt_qty, strike, premium, expiry, vol))
+
+    # ---- payoff: green where it gains, red where it loses
+    half = st.number_input("Chart half-width (points)", 5.0, 300.0, 40.0, 5.0, key="cso_st_w")
+    lo, hi = min(level - half, strike - 10), max(level + half, strike + 10)
+    S = strategy.grid(legs, mult, lo, hi)
+    combined = strategy.at_expiry(legs, S, mult)
+    chart = payoff_chart(
+        S, combined, strategy.at_expiry(held, S, mult), strategy.value_on(legs, S, mult, vol, rate, val_date),
+        current=level, strikes=[(strike, f"strike {strike:+g}")], breakevens=strategy.breakevens(legs, mult),
+        carry_limit=carry_limit if carry_limit is not None and lo <= carry_limit <= hi else None, band=band)
+    st.altair_chart(chart, width="stretch")
+    st.caption("**Green** = spread levels where the strategy makes money at expiry, **red** = where it loses. Solid line: "
+               "at expiry. Thin blue line: today's model value. Dashed grey: the position without the option.")
+
+    sm = strategy.summary(legs, mult)
+    m = st.columns(5)
+    m[0].metric("Premium paid", usd(sm["premium_paid"]), help="What the option costs up front, before any move.")
+    m[1].metric("Max loss", "Unlimited" if sm["max_loss"] is None else usd(sm["max_loss"]))
+    m[2].metric("Max gain", "Unlimited" if sm["max_gain"] is None else usd(sm["max_gain"]),
+                help="In theory. In practice the spread can't widen far past full carry; see the next figure.")
+    m[3].metric("Break-even", ", ".join(f"{b:+.2f}" for b in sm["breakevens"]) or "—")
+    if carry_limit is not None:
+        m[4].metric(f"At full carry ({carry_limit:+.1f})", usd(float(strategy.at_expiry(legs, carry_limit, mult))),
+                help="P&L at expiry if the spread widens all the way to full carry, the practical limit of the downside.")
+
+    # ---- the same thing as a table, shaded the same way
+    step = max(1.0, float(round(half / 8)))
+    levels = np.arange(np.ceil(lo / step) * step, hi + 1e-9, step)
+    tbl = pd.DataFrame({
+        "Spread level": levels, "Move": levels - level,
+        "Position only": strategy.at_expiry(held, levels, mult),
+        "Option": strategy.at_expiry(legs[len(held):], levels, mult),
+        "Combined at expiry": strategy.at_expiry(legs, levels, mult),
+        "Combined today": strategy.value_on(legs, levels, mult, vol, rate, val_date)})
+    money = ["Position only", "Option", "Combined at expiry", "Combined today"]
+    st.dataframe(tbl.style.apply(_heat, subset=money[:2], axis=None).apply(_heat, subset=money[2:], axis=None)
+                 .format({"Spread level": "{:+.1f}", "Move": "{:+.1f}", **{c: usd for c in money}}),
+                 hide_index=True, width="stretch")      # the two groups are shaded on their own scales
 
 
 @st.fragment
 def tab_book():
+    if _no_book():
+        return
     b = book.value_book(positions, used, val_date, mult, rate)
     tot = b[["value", "delta", "gamma", "vega", "theta"]].sum()
     c = st.columns(6)
@@ -488,6 +661,8 @@ def tab_book():
 
 @st.fragment
 def tab_grid():
+    if _no_book():
+        return
     c = st.columns(3)
     width = c[0].number_input("Move range ± (points)", 5.0, 500.0, 40.0, 5.0, key="cso_grid_w")
     step = c[1].number_input("Step", 0.5, 50.0, 2.0, 0.5, key="cso_grid_s")
@@ -503,6 +678,8 @@ def tab_grid():
 
 @st.fragment
 def tab_vol():
+    if _no_book():
+        return
     c = st.columns(3)
     rng = c[0].number_input("Spread vol shift ± (points)", 1.0, 100.0, 6.0, 1.0, key="cso_vol_rng")
     mv = c[1].number_input("Spread move ± (points)", 5.0, 200.0, 30.0, 5.0, key="cso_vol_mv")
@@ -533,6 +710,8 @@ def tab_vol():
 
 @st.fragment
 def tab_theta():
+    if _no_book():
+        return
     d = st.slider("Days forward", 1, max_h, max_h, key="cso_theta_days")
     t = book.theta_path(positions, used, val_date, mult, rate, d)
     c = st.columns(2)
@@ -559,6 +738,8 @@ def _mc_controls(prefix: str, default_h: int):
 
 @st.fragment
 def tab_mc():
+    if _no_book():
+        return
     h, n, vv, sv, cap = _mc_controls("mc", 20)
     c = st.columns(2)
     xc = c[0].slider("Cross-spread corr", -0.5, 1.0, 0.5, 0.05, key="cso_mc_xc", help="Only matters with several spreads")
@@ -585,6 +766,8 @@ def tab_mc():
 
 @st.fragment
 def tab_hedge():
+    if _no_book():
+        return
     exp, hed = book.split_roles(positions)
     if not exp or not hed:
         st.info("Tag at least one row as **Exposure** (what's being hedged) and one as **Hedge / trade** to compare "
@@ -663,6 +846,9 @@ def tab_tools():
             st.caption(f"Delta {float(g['delta']):+.3f} · vega {float(g['vega']):.3f}/pt · theta {float(g['theta']):.3f}/day")
 
 
+with t_strategy:
+    if t_strategy.open:
+        tab_strategy()
 with t_book:
     if t_book.open:
         tab_book()
@@ -701,6 +887,9 @@ with st.expander("Model and contract assumptions"):
   under half a tick for six months or less at 4% rates.
 - **Prices:** the Fetch button pulls delayed futures prices from the market-data feed. Anything you type stays
   until you fetch again.
+- **Strategy builder:** P&L is measured against what the legs cost (a spread future against its entry level, an
+  option against its premium), at expiry and marked with the model today. Full carry follows the Cost of Carry
+  calculator: CME maximum storage plus interest at fed funds + 2.25%, between the two contracts' expiries.
 - **Check before trading:** the expiry date for each series, the listed strikes and the contract size, against
   CME's current contract specifications and expiry calendar.
         """)

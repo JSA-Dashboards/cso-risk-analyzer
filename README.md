@@ -21,15 +21,16 @@ python -m pytest tests -q
 
 **Admin portal:** bundled as `apps/cso_risk_analyzer/` in `jsa-admin-portal` (tile under *Futures, Options &
 Spreads*). That copy is a generated mirror — change it here, then run `python sync/sync_apps.py apply
-cso_risk_analyzer` in the portal repo (the daily sync PR also picks it up). The app reads no secrets and no
-database, so the portal needs nothing extra. Session and widget keys are prefixed `cso_` because every bundled
+cso_risk_analyzer` in the portal repo (the daily sync PR also picks it up). The app reads no database, and the one optional secret
+(`MASSIVE_API_KEY`, below) is already in the portal's Secrets, so the portal needs nothing extra. Session and widget keys are prefixed `cso_` because every bundled
 app shares one session.
 
 ## Secrets
 
 One optional secret: **`MASSIVE_API_KEY`** (root level in Streamlit Secrets, like the admin portal; a `[massive]` table with
 `api_key` also works, as does the environment variable). It turns on the *Fetch futures prices* button, which fills each
-spread's near and far price from Massive's delayed futures snapshot. The key stays server-side and is sent as a header.
+spread's near and far price from Massive's delayed futures snapshot; the Strategy builder also reads the fed-funds future and
+the spread's settlement history from it. The key stays server-side and is sent as a header.
 Without it the button is off and the app works with typed prices. Nothing else needs a secret.
 
 ## What it models
@@ -43,16 +44,24 @@ Without it the button is off and the app works with typed prices. Nothing else n
 - **Vol source:** typed in, or backed out of market-maker premiums (step 2), with a per-strike skew that can be
   applied to positions. Deriving spread vol from leg vols + correlation is available but is a diagnostic only: a 0.01
   change in correlation moves it ~25%.
-- **Tabs:** Book & Greeks (+ delta in futures-month terms), spread-move grid, spread move × vol matrix, theta burn,
-  Monte Carlo, **hedge effectiveness** (rows tagged *Exposure* vs *Hedge / trade*, same paths for both books), and
-  delta→strike / premium→IV tools.
+- **Strategy builder (first tab):** a position (long or short spread) with a bought put or call laid over it, shown as a
+  payoff chart **shaded green where the strategy gains and red where it loses**, plus break-even, max loss, the
+  P&L if the spread reaches full carry, and the same grid as a green/red table. Payoffs are exact (piecewise linear,
+  `cso/strategy.py` takes any list of legs, so more strategies are more legs, not new maths). Alongside it, from the
+  Cost of Carry calculator: full carry (CME maximum storage + interest at fed funds + 2.25%), % of full carry with
+  its traffic light, and the 12-month range the spread has actually traded in (Massive settlement history). It
+  needs no book of positions.
+- **Other tabs:** Book & Greeks (+ delta in futures-month terms), spread-move grid, spread move × vol matrix, theta
+  burn, Monte Carlo, **hedge effectiveness** (rows tagged *Exposure* vs *Hedge / trade*, same paths for both books),
+  and delta→strike / premium→IV tools.
 
 ## Known limits / to verify before client use
 
 - Exact expiry date per series, strike ladder and contract size: confirm on CME (not machine-verified here).
 - No hard full-carry bound in pricing; the optional *Full carry* only truncates the Monte Carlo.
 - No bid/offer; hedged results are measured against the model mark.
-- Placeholder prices/vols/expiries are pre-filled. The in-app note is **not** the firm's approved disclosure.
+- The app opens on illustrative example data (labelled as such). The disclosure is the Risk Analyzer's standard text
+  with the model and data-feed sentences adapted; compliance should confirm those sentences.
 
 ## CME sources checked (2026-10-15)
 
