@@ -70,6 +70,22 @@ def test_a_sold_put_collects_premium_and_has_unlimited_loss_on_the_carry_side():
     assert s["max_gain"] == pytest.approx(10 * 50 * 0.75) and s["max_loss"] is None
 
 
+def test_a_long_spread_with_a_sold_call_caps_the_gain_at_the_strike_plus_the_premium():
+    legs = [Leg(FUTURE, 10, -15.0), Leg(CALL, -10, -10.0, 0.75, EXP)]
+    s = strategy.summary(legs, MULT)
+    assert s["premium_paid"] == pytest.approx(-10 * 50 * 0.75)                              # received
+    assert s["max_gain"] == pytest.approx(10 * 50 * ((-10.0 - -15.0) + 0.75)) and s["max_loss"] is None
+    assert s["breakevens"] == pytest.approx([-15.0 - 0.75])                                 # entry less the premium kept
+    assert strategy.at_expiry(legs, -5.0, MULT) == pytest.approx(s["max_gain"])             # flat above the strike
+
+
+def test_a_short_spread_with_a_sold_put_caps_the_gain_at_the_strike_less_the_premium():
+    legs = [Leg(FUTURE, -10, -15.0), Leg(PUT, -10, -20.0, 0.75, EXP)]
+    s = strategy.summary(legs, MULT)
+    assert s["max_gain"] == pytest.approx(10 * 50 * ((-15.0 - -20.0) + 0.75)) and s["max_loss"] is None
+    assert s["breakevens"] == pytest.approx([-15.0 + 0.75])
+
+
 def test_put_spread_over_a_position_has_a_floor_and_a_cap_on_the_hedge():
     legs = put_over_long_spread() + [Leg(PUT, -10, -30.0, 0.10, EXP)]                       # sell the -30 put
     s = strategy.summary(legs, MULT)

@@ -679,25 +679,39 @@ def tab_strategy():
             st.caption(f"Last 12 months ({len(hist)} sessions): low {hist.min():+.2f} on {hist.idxmin():%b %d, %Y}, "
                        f"high {hist.max():+.2f} on {hist.idxmax():%b %d, %Y}. Shaded blue on the chart.")
 
-    # ---- the position and the option laid over it
-    st.markdown("#### Position and protection")
+    # ---- the spread position you hold, and the option you buy or sell against it
+    st.markdown("#### Position and option")
     sn, sf = sp.leg_sign()
-    legs_txt = f"{'buy' if sn > 0 else 'sell'} {sp.near_label} / {'buy' if sf > 0 else 'sell'} {sp.far_label}"
-    p1, p2, p3, p4 = st.columns([1.4, 1, 1, 1])
-    base = p1.segmented_control("Position being protected", ["Long spread", "Short spread", "No position"],
-                                default="Long spread", key="cso_st_base",
-                                help=f"Long spread = {legs_txt}. A put protects a long spread against the spread falling; "
-                                     "a call protects a short one.") or "No position"
+
+    def _held(choice: str) -> str:
+        """Name the long and the short contract of a spread position (a CSO's spread is near - far unless flipped)."""
+        if choice == "No position":
+            return choice
+        near_long = (sn > 0) == (choice == "Long spread")
+        long_leg, short_leg = (sp.near_label, sp.far_label) if near_long else (sp.far_label, sp.near_label)
+        return f"Long {long_leg} / short {short_leg}"
+
+    p1, p2, p3 = st.columns([3, 1, 1])
+    base = p1.segmented_control("Spread position", ["Long spread", "Short spread", "No position"], default="Long spread",
+                                key="cso_st_base", format_func=_held,
+                                help="Which contract month you are long and which you are short. A bought put protects a "
+                                     "long spread against the spread falling and a bought call protects a short one; a "
+                                     "sold option earns its premium but adds risk.") or "No position"
     qty = p2.number_input("Contracts", 1, 10000, 10, key="cso_st_qty")
     entry = p3.number_input("Entry level", value=float(round(level, 2)), step=0.25, format="%.2f", key=f"cso_st_entry_{sid}",
                             help="Where the spread position was put on. The default is today's level.")
-    opt = p4.segmented_control("Bought option", ["Put", "Call"], default="Put", key="cso_st_opt") or "Put"
 
-    o1, o2, o3, o4 = st.columns(4)
+    s1, s2, o1, o2 = st.columns(4)
+    side = s1.segmented_control("Option", ["Buy", "Sell"], default="Buy", key="cso_st_side",
+                                help="Buy = long the CSO: you pay the premium. Sell = short the CSO: you receive the "
+                                     "premium and carry its risk.") or "Buy"
+    opt = s2.segmented_control("Type", ["Put", "Call"], default="Put", key="cso_st_opt") or "Put"
     default_k = float(np.floor((level - 5) / 5) * 5) if opt == "Put" else float(np.ceil((level + 5) / 5) * 5)
     strike = o1.number_input("Strike", value=default_k, step=1.0, format="%.1f", key=f"cso_st_strike_{opt}_{sid}",
                              help="Spread strike in points. CSO strikes are 5 points apart (1 for the nearest spreads).")
     opt_qty = o2.number_input("Option contracts", 1, 10000, int(qty), key=f"cso_st_optqty_{qty}")
+
+    o3, o4, q1, q2 = st.columns([1, 1, 1, 1.3])
     expiry = o3.date_input("CSO expiry", val_date + timedelta(days=36), key="cso_st_expiry",
                            help="CSOs expire before the nearby future does: enter the series' actual date.")
     vol = o4.number_input("Spread vol (pts/yr)", 0.1, 500.0, float(round(sp.vol(), 2)), 0.5,
@@ -705,20 +719,24 @@ def tab_strategy():
                           help=None if vol_note is None else f"Starts at {vol_note}. Overwrite it with the vol you are quoted.")
     T = max((expiry - val_date).days, 0) / 365.0
     model_prem = float(pricing.price(opt == "Call", level, strike, vol, T, rate))
-    q1, q2 = st.columns([1, 2])
     psrc = q1.segmented_control("Premium", ["Model", "My quote"], default="Model", key="cso_st_psrc") or "Model"
+    got = "paid" if side == "Buy" else "received"
     if psrc == "My quote":
-        premium = q2.number_input("Premium paid (points)", 0.0, 500.0, float(_eighth(model_prem)), 0.125, format="%.3f",
-                                  key=f"cso_st_prem_{opt}_{strike}_{round(model_prem, 3)}")
+        premium = q2.number_input(f"Premium {got} (points)", 0.0, 500.0, float(_eighth(model_prem)), 0.125, format="%.3f",
+                                  key=f"cso_st_prem_{side}_{opt}_{strike}_{round(model_prem, 3)}")
     else:
         premium = model_prem
-        q2.caption(f"Model price {model_prem:.3f} points = {usd(model_prem * mult * opt_qty)} for {opt_qty} contract(s).")
+        q2.caption(f"Model price {model_prem:.3f} points = {usd(model_prem * mult * opt_qty)} {got} for {opt_qty} contract(s).")
+    if side == "Sell":
+        st.caption("A sold option keeps its premium only if it expires worthless. Past the strike the loss is not limited to "
+                   "the premium: see Max loss, and the figure at full carry, below.")
 
     legs = []
     if base != "No position":
         legs.append(strategy.Leg(strategy.FUTURE, qty if base == "Long spread" else -qty, entry))
     held = list(legs)
-    legs.append(strategy.Leg(strategy.PUT if opt == "Put" else strategy.CALL, opt_qty, strike, premium, expiry, vol))
+    legs.append(strategy.Leg(strategy.PUT if opt == "Put" else strategy.CALL, opt_qty if side == "Buy" else -opt_qty,
+                             strike, premium, expiry, vol))
 
     # ---- the chart's own controls, and the seasonal overlay's (the earlier years are read before the chart is drawn,
     # because their replays are dots on it)
@@ -766,7 +784,10 @@ def tab_strategy():
 
     sm = strategy.summary(legs, mult)
     m = st.columns(5)
-    m[0].metric("Premium paid", usd(sm["premium_paid"]), help="What the option costs up front, before any move.")
+    paid = sm["premium_paid"]
+    m[0].metric("Premium paid" if paid >= 0 else "Premium received", usd(abs(paid)),
+                help="What the option costs up front, before any move." if paid >= 0 else
+                "What you take in for selling the option. You keep it only if the option expires worthless.")
     m[1].metric("Max loss", "Unlimited" if sm["max_loss"] is None else usd(sm["max_loss"]))
     m[2].metric("Max gain", "Unlimited" if sm["max_gain"] is None else usd(sm["max_gain"]),
                 help="In theory. In practice the spread can't widen far past full carry; see the next figure.")
@@ -1116,7 +1137,7 @@ with st.expander("Model and contract assumptions"):
 - **Prices:** the Fetch button pulls delayed futures prices from the market-data feed. Anything you type stays
   until you fetch again.
 - **Strategy builder:** P&L is measured against what the legs cost (a spread future against its entry level, an
-  option against its premium), at expiry and marked with the model today. Full carry follows the Cost of Carry
+  option against the premium paid or received; the option can be bought or sold), at expiry and marked with the model today. Full carry follows the Cost of Carry
   calculator: CME maximum storage plus interest at fed funds + 2.25%, between the two contracts' expiries.
 - **Live curve and seasonal overlay:** the Strategy builder can take its spread from the feed's current curve (the
   nearest listed months, with prices). Its vol starts at your book's vol for the same pair, else at the spread's

@@ -45,8 +45,8 @@ Without it the button is off and the app works with typed prices. Nothing else n
 - **Vol source:** typed in, or backed out of market-maker premiums (step 2), with a per-strike skew that can be
   applied to positions. Deriving spread vol from leg vols + correlation is available but is a diagnostic only: a 0.01
   change in correlation moves it ~25%.
-- **Strategy builder (first tab):** a position (long or short spread) with a bought put or call laid over it, shown as a
-  payoff chart **shaded green where the strategy gains and red where it loses**, plus break-even, max loss, the
+- **Strategy builder (first tab):** a position (long or short spread, with the long and the short contract month named)
+  with a put or call laid over it, bought or sold, shown as a payoff chart **shaded green where the strategy gains and red where it loses**, plus break-even, max loss, the
   P&L if the spread reaches full carry, and the same grid as a green/red table. Payoffs are exact (piecewise linear,
   `cso/strategy.py` takes any list of legs, so more strategies are more legs, not new maths). Alongside it, from the
   Cost of Carry calculator: full carry (CME maximum storage + interest at fed funds + 2.25%), % of full carry with
