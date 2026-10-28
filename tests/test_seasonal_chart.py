@@ -89,3 +89,11 @@ def test_the_payoff_chart_draws_a_dot_per_replay_green_or_red_by_result():
     assert dots["encoding"]["fill"]["scale"]["range"] == [payoff_chart.GREEN, payoff_chart.RED]
     assert "color" not in dots["encoding"]                                      # a shared colour scale would recolour the dots
     assert len(payoff_chart.payoff_chart(*args, current=-15.0, replays=[]).to_dict()["layer"]) == len(plain["layer"])
+
+
+def test_a_put_spread_draws_both_strikes_and_keeps_both_on_the_axis():
+    spec = _chart(strike=[-20.0, -60.0], carry_limit=None).to_dict()
+    texts = [r["label"] for rows in spec["datasets"].values() for r in rows if "label" in r]
+    assert "strike -20" in texts and "strike -60" in texts
+    domain = spec["layer"][0]["encoding"]["y"]["scale"]["domain"]
+    assert domain[0] < -60.0                                                    # the far strike stretches the axis rather than falling off it

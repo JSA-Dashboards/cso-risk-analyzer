@@ -42,7 +42,7 @@ def _vmarks(days, labels, color, dash, x_scale, dy=2, left_of_line=False):
 
 def seasonal_chart(current: pd.Series | None, priors: dict[int, pd.Series], average: pd.Series | None, *,
                    near_expiry: date, window: int, today: date, option_expiry: date | None = None,
-                   strike: float | None = None, breakevens=(), entry: float | None = None,
+                   strike: float | list[float] | None = None, breakevens=(), entry: float | None = None,
                    carry_limit: float | None = None, y_title: str = "Spread level (near − far, points)",
                    height: int = 420):
     """Layered Altair chart. ``priors`` maps a year to its spread on the live contract's calendar dates, most recent
@@ -66,7 +66,8 @@ def seasonal_chart(current: pd.Series | None, priors: dict[int, pd.Series], aver
     names = [n for n in (CURRENT, *[str(y) for y in priors], AVERAGE) if n in style]
     colors, widths, dashes = ([style[n][i] for n in names] for i in range(3))
 
-    levels = [v for v in (strike, entry, *breakevens) if v is not None]
+    strikes = [] if strike is None else ([float(strike)] if isinstance(strike, (int, float)) else [float(k) for k in strike])
+    levels = [v for v in (*strikes, entry, *breakevens) if v is not None]
     data_lo, data_hi = float(lines["Spread"].min()), float(lines["Spread"].max())
     if carry_limit is not None and data_lo - 1.5 * (data_hi - data_lo) <= carry_limit <= data_hi + 1.5 * (data_hi - data_lo):
         levels.append(carry_limit)                       # a far-off full carry would only flatten the chart
@@ -83,8 +84,8 @@ def seasonal_chart(current: pd.Series | None, priors: dict[int, pd.Series], aver
         strokeDash=alt.StrokeDash("Series:N", scale=alt.Scale(domain=names, range=dashes), legend=None),
         tooltip=[alt.Tooltip("Series:N"), alt.Tooltip("Date:T", format="%b %d"), alt.Tooltip("Spread:Q", format=".2f")])]
 
-    if strike is not None:
-        layers += _hmarks([strike], [f"strike {strike:+g}"], ORANGE, [5, 4], y_scale)
+    if strikes:
+        layers += _hmarks(strikes, [f"strike {k:+g}" for k in strikes], ORANGE, [5, 4], y_scale)
     if len(breakevens):
         layers += _hmarks(list(breakevens), [f"break-even {b:+.2f}" for b in breakevens], MUTED, [2, 3], y_scale)
     if entry is not None:

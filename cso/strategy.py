@@ -130,3 +130,44 @@ def grid(legs, mult: float, lo: float, hi: float, n: int = 401) -> np.ndarray:
     xs |= {k for k in kinks(legs) if lo <= k <= hi}
     xs |= {b for b in breakevens(legs, mult) if lo <= b <= hi}
     return np.array(sorted(xs))
+
+
+def name_of(legs) -> str:
+    """A trader's name for what the legs add up to: Put spread, Collar, Straddle, Risk reversal ...
+
+    One or two options over a spread position. Two options of one kind on opposite sides are a put or call spread (a
+    credit spread when the bought one is the nearer to the money). A put and a call are a straddle or strangle when
+    both are bought, a short straddle or strangle when both are sold, and otherwise a collar when the bought one works
+    against the position (a put over a long spread, a call over a short one) and a risk reversal when it does not.
+    """
+    opts = [leg for leg in legs if leg.kind != FUTURE]
+    held = sum(leg.qty for leg in legs if leg.kind == FUTURE)
+    if not opts:
+        return "Spread position" if held else "Nothing"
+    if len(opts) == 1:
+        return f"{'Long' if opts[0].qty > 0 else 'Short'} {opts[0].kind.lower()}"
+    if len(opts) > 2:
+        return "Custom"
+    a, b = opts
+    if a.kind == b.kind:
+        if (a.qty > 0) == (b.qty > 0):
+            return f"Two {a.kind.lower()}s"
+        bought, sold = (a, b) if a.qty > 0 else (b, a)
+        if bought.strike == sold.strike:
+            return "Offsetting options"
+        debit = bought.strike > sold.strike if a.kind == PUT else bought.strike < sold.strike
+        name = f"{'Ratio ' if abs(a.qty) != abs(b.qty) else ''}{a.kind.lower()} spread"
+        name = name[0].upper() + name[1:]
+        return name if debit else f"{name} (credit)"
+    put, call = (a, b) if a.kind == PUT else (b, a)
+    if put.qty > 0 and call.qty > 0:
+        return "Straddle" if put.strike == call.strike else "Strangle"
+    if put.qty < 0 and call.qty < 0:
+        return "Short straddle" if put.strike == call.strike else "Short strangle"
+    return "Collar" if held != 0 and (put.qty > 0) == (held > 0) else "Risk reversal"
+
+
+def describe(legs) -> str:
+    """The option legs in words: "buy 10 -20 put, sell 10 -10 call"."""
+    return ", ".join(f"{'buy' if leg.qty > 0 else 'sell'} {abs(leg.qty):g} {leg.strike:+g} {leg.kind.lower()}"
+                     for leg in legs if leg.kind != FUTURE)
